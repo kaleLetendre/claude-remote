@@ -1,0 +1,18 @@
+{
+  "version": "0.1.0",
+  "settingsVersion": 1,
+  "minClientVersion": "0.1.0",
+  "changelog": [
+    {
+      "version": "0.1.0",
+      "date": "2026-03-31",
+      "changes": [
+        "Initial release",
+        "Multi-session terminal management",
+        "TTS/STT voice support",
+        "Tailscale-ready networking",
+        "Raw + clean terminal views"
+      ]
+    }
+  ]
+}

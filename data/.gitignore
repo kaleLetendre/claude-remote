@@ -1,0 +1,3 @@
+# Ignore all user data but keep the directory
+*
+!.gitignore
