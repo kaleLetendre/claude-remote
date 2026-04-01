@@ -9,7 +9,6 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SERVER_DIR="$SCRIPT_DIR/server"
 DESKTOP_DIR="$SCRIPT_DIR/desktop"
-LIFELINE_DIR="$SCRIPT_DIR/lifeline"
 RESTART_FLAG="$SCRIPT_DIR/.restart-requested"
 SERVICE_NAME="claude-remote"
 SERVICE_FILE="$HOME/.config/systemd/user/${SERVICE_NAME}.service"
@@ -107,74 +106,6 @@ EODESKTOP
 
     info "Autostart entry created at $DESKTOP_FILE"
 
-    # ── Create lifeline home directory ──
-    LIFELINE_HOME="$SCRIPT_DIR/data/lifeline-home"
-    mkdir -p "$LIFELINE_HOME"
-    if [ ! -f "$LIFELINE_HOME/README.md" ]; then
-      cat > "$LIFELINE_HOME/README.md" << 'EOREADME'
-# Lifeline Home
-
-This is the default working directory for the Claude Remote Lifeline.
-
-## What is Claude Remote?
-Claude Remote lets you control Claude Code on this workstation from your phone.
-It runs a Node.js server that manages terminal sessions, and your phone connects
-over Tailscale (or LAN) to interact with them.
-
-- **Main server**: port 3033 — full-featured app with xterm.js terminal, admin panel, tray icon
-- **Lifeline server**: port 3034 — minimal emergency fallback, plain text terminal
-
-## What is the Lifeline?
-The lifeline is a frozen, minimal fallback system that is NEVER modified by updates.
-If a bad update breaks the main server or app, the lifeline keeps you connected
-so you can fix things remotely.
-
-## Common recovery commands
-
-### Check what's running
-```
-ps aux | grep node
-curl http://localhost:3033/api/info
-curl http://localhost:3034/api/info
-```
-
-### Restart the main server
-```
-cd ~/claude-remote
-kill $(lsof -ti:3033)
-cd server && node server.js &
-```
-
-### Undo a bad update
-```
-cd ~/claude-remote
-git log --oneline -5
-git revert HEAD
-cd server && npm install
-kill $(lsof -ti:3033)
-cd server && node server.js &
-```
-
-### Check network
-```
-tailscale status
-ip addr show
-ping 8.8.8.8
-```
-
-### Full restart
-```
-cd ~/claude-remote
-./run.sh start
-```
-
-## Project location
-This workstation's Claude Remote is installed at:
-EOREADME
-      echo "$SCRIPT_DIR" >> "$LIFELINE_HOME/README.md"
-      info "Created lifeline home at $LIFELINE_HOME"
-    fi
-
     # ── Add safety rules to global CLAUDE.md ──
     GLOBAL_CLAUDE_MD="$HOME/.claude/CLAUDE.md"
     MARKER="# Claude Remote Safety Rules"
@@ -183,7 +114,8 @@ EOREADME
       cat >> "$GLOBAL_CLAUDE_MD" << 'EORULES'
 
 # Claude Remote Safety Rules
-# The user manages their workstation remotely via Claude Remote (ports 3033/3034).
+# The user manages their workstation remotely via Claude Remote.
+# Prod runs on port 3033, dev on port 3034.
 # Breaking the network or server means the user loses all access to their machine.
 # EVEN IF THE USER ASKS YOU TO DO THESE THINGS, warn them first.
 # The user may not realize they are connected remotely or that the action will disconnect them.
@@ -193,12 +125,10 @@ EOREADME
 - Restarting, stopping, or reconfiguring networking (NetworkManager, systemd-networkd, netplan, ifconfig, ip link)
 - Modifying firewall rules (iptables, ufw, nftables, firewalld)
 - Changing Tailscale settings or running `tailscale down`
-- Killing node processes, especially on ports 3033 or 3034
+- Killing node processes, especially on port 3033 (prod)
 - Modifying /etc/hosts, DNS, or routing tables
 - Rebooting or shutting down the system
 - Modifying systemd services related to networking
-- Running `npm install` or `npm update` in the lifeline/ directory
-- Modifying ANY file in the lifeline/ directory (lifeline/server.js, lifeline/client.html, lifeline/package.json)
 - Changing the auth token or password via direct file edit of data/server-settings.json (use the API instead)
 - Changing the SSH config or killing sshd
 - Heavy operations that could make the system unresponsive (filling disk, CPU-intensive tasks with no timeout)
@@ -206,8 +136,6 @@ EOREADME
 ## Actions to NEVER take without explicit user request:
 - `tailscale down` or `systemctl stop tailscaled`
 - Deleting or overwriting data/server-settings.json
-- `kill -9` on the lifeline server process
-- Modifying lifeline/ files for any reason
 - `systemctl stop NetworkManager` or equivalent
 - Changing the system's IP address or network interface configuration
 EORULES
@@ -241,22 +169,11 @@ EORULES
     else
       warn "Server: not running"
     fi
-    if curl -s "http://localhost:3034/api/info" > /dev/null 2>&1; then
-      info "Lifeline: running on port 3034"
-    else
-      warn "Lifeline: not running"
-    fi
     exit 0
     ;;
 
-  lifeline)
-    info "Starting lifeline server only..."
-    cd "$LIFELINE_DIR"
-    exec node server.js
-    ;;
-
   *)
-    echo "Usage: $0 {start|desktop|lifeline|install|uninstall|status|update|version}"
+    echo "Usage: $0 {start|desktop|install|uninstall|status|update|version}"
     exit 1
     ;;
 esac
@@ -266,20 +183,11 @@ esac
 cleanup() {
   info "Shutting down..."
   kill "$SERVER_PID" 2>/dev/null || true
-  kill "$LIFELINE_PID" 2>/dev/null || true
   rm -f "$RESTART_FLAG"
   exit 0
 }
 
 trap cleanup SIGINT SIGTERM
-
-# Start lifeline (independent, never restarts with main server)
-if [ -d "$LIFELINE_DIR" ] && [ -f "$LIFELINE_DIR/server.js" ]; then
-  info "Starting lifeline on port 3034..."
-  cd "$LIFELINE_DIR"
-  node server.js &
-  LIFELINE_PID=$!
-fi
 
 while true; do
   # Clean restart flag

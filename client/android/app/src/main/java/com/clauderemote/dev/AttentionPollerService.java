@@ -1,4 +1,4 @@
-package com.clauderemote.app;
+package com.clauderemote.dev;
 
 import android.app.Notification;
 import android.app.NotificationChannel;

@@ -197,28 +197,14 @@ Git-ignored directory for persistent user data. Key files:
 
 ---
 
-## CRITICAL: Lifeline Protection
+## Prod/Dev Setup
 
-**NEVER modify files in the `lifeline/` directory unless the user explicitly asks you to.** The lifeline is a frozen emergency fallback system. If the main server breaks due to a bad update, the lifeline on port 3034 keeps the user connected so they can fix things remotely.
+This project uses two instances running simultaneously:
 
-Do NOT:
-- "Improve" or refactor lifeline code — even if you see bugs or inefficiencies, leave it alone
-- Add features to the lifeline — it is intentionally minimal
-- Update lifeline dependencies — they are pinned on purpose
-- Fix lint warnings, add error handling, or clean up the lifeline code
-- Include lifeline files in any bulk edits, renames, or refactors
-- Run `npm install` or `npm update` in the `lifeline/` directory
+- **Prod** (`~/claude-remote-prod`, main branch): port 3033 — stable version, serves as the safety net
+- **Dev** (`~/claude-remote`, dev branch): port 3034 — active development
 
-The only acceptable reason to touch lifeline is if the user explicitly says something like "update the lifeline" or "fix the lifeline". Even then, confirm before making changes.
-
-Protected files:
-- `lifeline/server.js` — standalone server
-- `lifeline/client.html` — single-file terminal UI
-- `lifeline/package.json` — pinned dependencies
-- `lifeline/app/` — separate Capacitor APK project
-- `data/lifeline-home/` — default working directory with recovery README
-
-The lifeline has its own `node_modules/`, its own port (3034), and zero imports from `server/`. It reads only `data/server-settings.json` for auth credentials.
+**NEVER kill the prod server on port 3033** unless the user explicitly asks. If the dev server breaks, prod keeps the user connected remotely.
 
 ---
 

@@ -1,4 +1,4 @@
-package com.clauderemote.app;
+package com.clauderemote.dev;
 
 import android.content.Intent;
 import android.os.Build;

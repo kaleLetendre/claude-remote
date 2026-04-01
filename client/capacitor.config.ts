@@ -1,8 +1,8 @@
 import type { CapacitorConfig } from '@capacitor/cli';
 
 const config: CapacitorConfig = {
-  appId: 'com.clauderemote.app',
-  appName: 'Claude Remote',
+  appId: 'com.clauderemote.dev',
+  appName: 'Claude Remote Dev',
   webDir: 'bootstrap',
   server: {
     cleartext: true,  // Allow HTTP (needed for local network / Tailscale)

@@ -14,7 +14,7 @@ export const PATHS = {
 
 // ── Default settings by version ─────────────────────────────
 const DEFAULTS = {
-  port: 3033,
+  port: 3034,
   authToken: null,        // null = generate random on first run, then persist
   password: null,         // null = no password set; { hash, salt } when set
   shell: null,            // null = use $SHELL
