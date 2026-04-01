@@ -850,6 +850,7 @@ function initTerminal() {
     scrollback: 5000,
     convertEol: false,
     allowTransparency: true,
+    disableStdin: true,  // Terminal is read-only — input goes through the cmd bar
   });
 
   const fitAddon = new window.FitAddon.FitAddon();
@@ -867,10 +868,15 @@ function initTerminal() {
     });
   }, 100);
 
-  // Handle keyboard input in raw mode
-  term.onData((data) => {
-    wsSend({ type: 'input', sessionId: state.activeSessionId, data });
-  });
+  // Terminal is read-only — prevent xterm's hidden textarea from capturing focus.
+  // All input goes through the cmd-input bar.
+  setTimeout(() => {
+    const xtermTextarea = container.querySelector('.xterm-helper-textarea');
+    if (xtermTextarea) {
+      xtermTextarea.disabled = true;
+      xtermTextarea.style.display = 'none';
+    }
+  }, 200);
 
   // Resize on orientation change — skip when keyboard opens/closes to avoid scroll jumps
   let resizeTimer = null;
@@ -903,28 +909,8 @@ function initTerminal() {
   });
   resizeObserver.observe(container);
 
-  // Tap terminal to focus input — but only on quick tap, not long-press (text selection)
-  let _tapStart = 0;
-  let _tapX = 0;
-  let _tapY = 0;
-  container.addEventListener('touchstart', (e) => {
-    _tapStart = Date.now();
-    _tapX = e.touches[0].clientX;
-    _tapY = e.touches[0].clientY;
-  }, { passive: true });
-  container.addEventListener('touchend', (e) => {
-    const dt = Date.now() - _tapStart;
-    const dx = e.changedTouches[0].clientX - _tapX;
-    const dy = e.changedTouches[0].clientY - _tapY;
-    // Quick tap (< 300ms) with minimal movement (< 10px) = focus input
-    // Long press or drag = let the browser handle text selection
-    if (dt < 300 && Math.abs(dx) < 10 && Math.abs(dy) < 10) {
-      if (!window.getSelection()?.toString()) {
-        const input = $('#cmd-input');
-        if (input) input.focus();
-      }
-    }
-  }, { passive: true });
+  // Terminal is read-only (disableStdin: true) — taps allow text selection and scrolling.
+  // The cmd-input bar at the bottom handles all user input.
 
   // Momentum scrolling for xterm on mobile
   // xterm handles scroll via JS (not native overflow), so we add inertia
@@ -954,8 +940,20 @@ function initTerminal() {
         // Moved — it's a scroll, not a long press
         clearTimeout(_longPressTimer);
       }, { passive: true });
-      container.addEventListener('touchend', () => {
+      container.addEventListener('touchend', (e) => {
+        const wasLongPress = !_longPressTimer;
         clearTimeout(_longPressTimer);
+        _longPressTimer = null;
+
+        // Quick tap while text is selected → clear selection
+        if (!wasLongPress && window.getSelection()?.toString()) {
+          window.getSelection().removeAllRanges();
+          screen.style.pointerEvents = 'none';
+          screen.style.userSelect = '';
+          screen.style.webkitUserSelect = '';
+          return;
+        }
+
         // Re-disable after a delay so copy menu can be used
         setTimeout(() => {
           if (!window.getSelection()?.toString()) {
@@ -1345,9 +1343,9 @@ function initSettings() {
       saveSettings();
 
       // Sync TTS header button
-      const voiceBtn = $('#btn-voice');
-      if (key === 'ttsEnabled') {
-        voiceBtn.classList.toggle('active', state.ttsEnabled);
+      const vBtn = $('#btn-voice');
+      if (key === 'ttsEnabled' && vBtn) {
+        vBtn.classList.toggle('active', state.ttsEnabled);
         if (!state.ttsEnabled) speechSynthesis.cancel();
       }
     };
@@ -1420,6 +1418,16 @@ function initSettings() {
 
   // Version + Git info
   fetchVersionInfo();
+
+  // Disconnect button
+  const disconnectBtn = $('#btn-disconnect');
+  if (disconnectBtn) {
+    disconnectBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      disconnectServer();
+    });
+  }
 
   // Check for updates button
   const checkBtn = $('#btn-check-update');
@@ -1508,6 +1516,10 @@ function disconnectServer() {
   state.connected = false;
   if (state.ws) { state.ws.close(); state.ws = null; }
   saveSettings();
+  // Tell bootstrap parent to stop polling and show login
+  if (window.parent !== window) {
+    window.parent.postMessage({ type: 'logout' }, '*');
+  }
   navigate('connect');
 }
 
@@ -1518,12 +1530,15 @@ $('#btn-settings').onclick = () => {
   if (state.currentView === 'settings') navigate('dashboard');
   else navigate('settings');
 };
-$('#btn-voice').onclick = () => {
-  state.ttsEnabled = !state.ttsEnabled;
-  $('#btn-voice').classList.toggle('active', state.ttsEnabled);
-  if (!state.ttsEnabled) speechSynthesis.cancel();
-  saveSettings();
-};
+const voiceBtn = $('#btn-voice');
+if (voiceBtn) {
+  voiceBtn.onclick = () => {
+    state.ttsEnabled = !state.ttsEnabled;
+    voiceBtn.classList.toggle('active', state.ttsEnabled);
+    if (!state.ttsEnabled) speechSynthesis.cancel();
+    saveSettings();
+  };
+}
 
 // ── Init ────────────────────────────────────────────────────
 

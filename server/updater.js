@@ -1,11 +1,10 @@
 import { execSync, exec } from 'child_process';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { join } from 'path';
 import { EventEmitter } from 'events';
+import { PACKAGE_ROOT } from '../lib/paths.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const ROOT = join(__dirname, '..');
+const ROOT = PACKAGE_ROOT;
 
 export class Updater extends EventEmitter {
   constructor({ autoCheck = false, checkInterval = 300_000 } = {}) {

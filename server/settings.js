@@ -1,15 +1,17 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 import crypto from 'crypto';
+import {
+  getSettingsPath, getConnectionInfoPath, getVersionPath,
+  ensureDataDir, migrateDataDir,
+} from '../lib/paths.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const ROOT = join(__dirname, '..');
+// Run one-time migration from ./data/ to ~/.claude-remote/
+migrateDataDir();
 
 // ── Settings file paths (canonical locations) ───────────────
 export const PATHS = {
-  serverSettings: join(ROOT, 'data', 'server-settings.json'),
-  connectionInfo: join(ROOT, 'data', 'connection-info.json'),
+  serverSettings: getSettingsPath(),
+  connectionInfo: getConnectionInfoPath(),
 };
 
 // ── Default settings by version ─────────────────────────────
@@ -82,17 +84,10 @@ export function migrateSettings(settings) {
 
 function getCurrentSchemaVersion() {
   try {
-    const raw = readFileSync(join(ROOT, 'version.json'), 'utf8');
+    const raw = readFileSync(getVersionPath(), 'utf8');
     return JSON.parse(raw).settingsVersion || 1;
   } catch {
     return 1;
-  }
-}
-
-function ensureDataDir() {
-  const dataDir = join(ROOT, 'data');
-  if (!existsSync(dataDir)) {
-    mkdirSync(dataDir, { recursive: true });
   }
 }
 

@@ -4,14 +4,18 @@
 // ═══════════════════════════════════════════════════════════════
 
 import { readFileSync, existsSync } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { join } from 'path';
 import { createInterface } from 'readline';
-import { execSync } from 'child_process';
+import { execSync, spawn as cpSpawn } from 'child_process';
+import {
+  PACKAGE_ROOT, getSettingsPath, getConnectionInfoPath, getServerDir,
+  getDataDir, ensureDataDir, migrateDataDir,
+} from './lib/paths.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const SETTINGS_PATH = join(__dirname, 'data', 'server-settings.json');
-const CONN_INFO_PATH = join(__dirname, 'data', 'connection-info.json');
+migrateDataDir();
+
+const SETTINGS_PATH = getSettingsPath();
+const CONN_INFO_PATH = getConnectionInfoPath();
 
 // ── Helpers ─────────────────────────────────────────────────
 
@@ -217,7 +221,7 @@ async function cmdApplyUpdate() {
 }
 
 async function cmdBuildApk() {
-  const clientDir = join(__dirname, 'client');
+  const clientDir = join(PACKAGE_ROOT, 'client');
   const androidDir = join(clientDir, 'android');
 
   console.log(C.dim('Syncing Capacitor...'));
@@ -235,11 +239,152 @@ async function cmdBuildApk() {
   }
 }
 
+// ── Setup ──────────────────────────────────────────────────
+
+async function cmdSetup() {
+  const platform = process.platform;
+  console.log(`\n${C.bold('Claude Remote Setup')}\n`);
+  console.log(`Platform: ${platform}, Node: ${process.version}\n`);
+
+  // Step 1: Install server dependencies
+  const serverDir = getServerDir();
+  const nodeModules = join(serverDir, 'node_modules');
+  if (!existsSync(nodeModules)) {
+    console.log(C.yellow('Installing server dependencies...'));
+    try {
+      execSync('npm install', { cwd: serverDir, stdio: 'inherit' });
+      console.log(C.green('Dependencies installed.\n'));
+    } catch {
+      console.log(C.red('\nFailed to install dependencies. node-pty requires C++ build tools:'));
+      if (platform === 'linux') {
+        console.log(`  ${C.bold('sudo apt install -y build-essential python3')}`);
+      } else if (platform === 'darwin') {
+        console.log(`  ${C.bold('xcode-select --install')}`);
+      } else if (platform === 'win32') {
+        console.log(`  ${C.bold('npm install -g windows-build-tools')} (run as Administrator)`);
+      }
+      console.log('\nInstall build tools, then run `claude-remote setup` again.');
+      process.exit(1);
+    }
+  } else {
+    console.log(C.green('Server dependencies: OK'));
+  }
+
+  // Step 2: Tailscale check
+  console.log(`\n${C.bold('── Tailscale ──')}\n`);
+  let tailscaleInstalled = false;
+  let tailscaleIp = null;
+  try {
+    const which = platform === 'win32' ? 'where' : 'which';
+    execSync(`${which} tailscale`, { stdio: 'pipe' });
+    tailscaleInstalled = true;
+    try {
+      const status = execSync('tailscale status --json', { encoding: 'utf8', stdio: 'pipe' });
+      const parsed = JSON.parse(status);
+      if (parsed.Self?.TailscaleIPs?.length) {
+        tailscaleIp = parsed.Self.TailscaleIPs.find(ip => ip.startsWith('100.'));
+      }
+    } catch {}
+  } catch {}
+
+  if (tailscaleIp) {
+    console.log(C.green(`Tailscale connected: ${tailscaleIp}`));
+  } else if (tailscaleInstalled) {
+    console.log(C.yellow('Tailscale installed but not connected.'));
+    if (platform === 'win32') {
+      console.log(`  Open the Tailscale app and sign in.`);
+    } else {
+      console.log(`  Run: ${C.bold('sudo tailscale up')}`);
+    }
+  } else {
+    console.log(C.yellow('Tailscale not found. Install it for remote access over the internet:'));
+    if (platform === 'linux') {
+      console.log(`  ${C.bold('curl -fsSL https://tailscale.com/install.sh | sh')}`);
+    } else if (platform === 'darwin') {
+      console.log(`  ${C.bold('brew install tailscale')}  or install from the Mac App Store`);
+    } else if (platform === 'win32') {
+      console.log(`  Download from: ${C.bold('https://tailscale.com/download/windows')}`);
+    }
+    console.log(`\n  ${C.dim('Without Tailscale, the app will only work on your local network.')}`);
+  }
+
+  console.log(`\n  ${C.dim('Phone setup: Install Tailscale from the Play Store and sign in with the same account.')}`);
+
+  // Step 3: Generate token
+  console.log(`\n${C.bold('── Authentication ──')}\n`);
+  ensureDataDir();
+  const { loadServerSettings, saveServerSettings, hashPassword } = await import('./server/settings.js');
+  const settings = loadServerSettings();
+  if (!settings.authToken) {
+    const crypto = await import('crypto');
+    settings.authToken = crypto.randomBytes(16).toString('hex');
+    saveServerSettings(settings);
+    console.log(C.green('Auth token generated.'));
+  } else {
+    console.log(C.green('Auth token: exists'));
+  }
+
+  // Step 4: Offer password setup
+  if (!settings.password) {
+    const answer = await prompt('Set a password for phone login? [y/N] ');
+    if (answer.toLowerCase() === 'y') {
+      const pw = await prompt('Password: ');
+      if (pw.trim()) {
+        settings.password = hashPassword(pw.trim());
+        saveServerSettings(settings);
+        console.log(C.green('Password set.'));
+      }
+    }
+  } else {
+    console.log(C.green('Password: set'));
+  }
+
+  // Step 5: Connection info
+  console.log(`\n${C.bold('── Connection Info ──')}\n`);
+  const port = settings.port;
+  if (tailscaleIp) {
+    console.log(`  Server URL: ${C.bold(`http://${tailscaleIp}:${port}`)}`);
+  } else {
+    console.log(`  Server URL: ${C.bold(`http://localhost:${port}`)}`);
+    console.log(`  ${C.dim('(Set up Tailscale to connect from your phone outside your network)')}`);
+  }
+  console.log(`  Auth token: ${C.dim(settings.authToken)}`);
+
+  // Step 6: APK guide
+  console.log(`\n${C.bold('── Android App ──')}\n`);
+  console.log('  Install the Android app on your phone:');
+  console.log(`  1. Open: ${C.bold('https://github.com/kaleLetendre/claude-remote/releases/latest')}`);
+  console.log('  2. Download claude-remote.apk');
+  console.log('  3. Install it (enable "Install from unknown sources" if prompted)');
+  console.log('  4. Open the app and enter your server URL and password/token');
+
+  // Step 7: Offer to start
+  console.log();
+  const start = await prompt('Start the server now? [Y/n] ');
+  if (start.toLowerCase() !== 'n') {
+    console.log();
+    await cmdStart();
+  }
+}
+
+async function cmdStart() {
+  const runner = join(PACKAGE_ROOT, 'runner.js');
+  const child = cpSpawn(process.execPath, [runner, 'start'], { stdio: 'inherit' });
+  child.on('exit', (code) => process.exit(code ?? 0));
+  // Forward signals
+  process.on('SIGINT', () => child.kill('SIGINT'));
+  process.on('SIGTERM', () => child.kill('SIGTERM'));
+  // Keep this process alive while child runs
+  await new Promise(() => {});
+}
+
 // ── CLI router ──────────────────────────────────────────────
 
 const [cmd, ...args] = process.argv.slice(2);
 
 const commands = {
+  setup:            { fn: cmdSetup,          desc: 'Interactive first-time setup' },
+  start:            { fn: cmdStart,          desc: 'Start the server' },
   status:           { fn: cmdStatus,         desc: 'Show server status' },
   token:            { fn: cmdToken,          desc: 'Print auth token' },
   url:              { fn: cmdUrl,            desc: 'Print phone connection URL' },
@@ -254,8 +399,8 @@ const commands = {
 };
 
 if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
-  console.log(`\n${C.bold('claude-remote-cli')} — manage Claude Remote from the command line\n`);
-  console.log('Usage: node cli.js <command>\n');
+  console.log(`\n${C.bold('claude-remote')} — control Claude Code from your phone\n`);
+  console.log('Usage: claude-remote <command>\n');
   console.log('Commands:');
   const maxLen = Math.max(...Object.keys(commands).map(k => k.length));
   for (const [name, { desc }] of Object.entries(commands)) {
@@ -267,7 +412,7 @@ if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
 
 if (!commands[cmd]) {
   console.error(`Unknown command: ${cmd}`);
-  console.error(`Run 'node cli.js help' for available commands`);
+  console.error(`Run 'claude-remote help' for available commands`);
   process.exit(1);
 }
 

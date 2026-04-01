@@ -1,16 +1,16 @@
 import express from 'express';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import { join } from 'path';
 import { readFileSync, writeFileSync, existsSync, statSync } from 'fs';
 import crypto from 'crypto';
 import os from 'os';
 import { SessionManager } from './sessions.js';
 import { Updater } from './updater.js';
 import { loadServerSettings, saveServerSettings, hashPassword, verifyPassword } from './settings.js';
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
+import {
+  PACKAGE_ROOT, getClientWwwDir, getConnectionInfoPath, getDataDir, ensureDataDir,
+} from '../lib/paths.js';
 
 // ── Config (persistent) ────────────────────────────────────────────
 const settings = loadServerSettings();
@@ -51,11 +51,11 @@ app.use((req, res, next) => {
 });
 
 // Serve client from sibling directory
-app.use(express.static(join(__dirname, '..', 'client', 'www')));
+app.use(express.static(getClientWwwDir()));
 
 // Admin page (clean URL)
 app.get('/admin', (req, res) => {
-  res.sendFile(join(__dirname, '..', 'client', 'www', 'admin.html'));
+  res.sendFile(join(getClientWwwDir(), 'admin.html'));
 });
 
 // ── Auth middleware ──────────────────────────────────────────────────
@@ -200,16 +200,20 @@ app.post('/api/restart', authCheck, (req, res) => {
 
 // ── APK distribution ───────────────────────────────────────────────
 
-const APK_PATH = join(__dirname, '..', 'client', 'android', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
+const APK_PATH_BUILD = join(PACKAGE_ROOT, 'client', 'android', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
+const APK_PATH_DATA = join(getDataDir(), 'claude-remote.apk');
+// Check build output first (git clone), then data dir (npm install / manual download)
+const getApkPath = () => existsSync(APK_PATH_BUILD) ? APK_PATH_BUILD : existsSync(APK_PATH_DATA) ? APK_PATH_DATA : null;
 
 // Check app version (unauthenticated — so the bootstrap screen can check)
 app.get('/api/app/version', (req, res) => {
   try {
-    const ver = JSON.parse(readFileSync(join(__dirname, '..', 'version.json'), 'utf8'));
-    const hasApk = existsSync(APK_PATH);
+    const ver = JSON.parse(readFileSync(join(PACKAGE_ROOT, 'version.json'), 'utf8'));
+    const apkPath = getApkPath();
+    const hasApk = !!apkPath;
     let apkSize = null;
     if (hasApk) {
-      apkSize = statSync(APK_PATH).size;
+      apkSize = statSync(apkPath).size;
     }
     res.json({ version: ver.version, hasApk, apkSize });
   } catch (e) {
@@ -219,12 +223,13 @@ app.get('/api/app/version', (req, res) => {
 
 // Download APK
 app.get('/api/app/download', (req, res) => {
-  if (!existsSync(APK_PATH)) {
-    return res.status(404).json({ error: 'APK not built. Run: cd client/android && ./gradlew assembleDebug' });
+  const apkPath = getApkPath();
+  if (!apkPath) {
+    return res.status(404).json({ error: 'APK not available. Download from GitHub releases.' });
   }
   res.setHeader('Content-Type', 'application/vnd.android.package-archive');
   res.setHeader('Content-Disposition', 'attachment; filename="claude-remote.apk"');
-  res.download(APK_PATH, 'claude-remote.apk');
+  res.download(apkPath, 'claude-remote.apk');
 });
 
 // ── Admin API ──────────────────────────────────────────────────────
@@ -471,8 +476,8 @@ server.listen(PORT, '0.0.0.0', () => {
   }, null, 2);
 
   try {
-    writeFileSync(join(__dirname, '..', 'data', 'connection-info.json'), connInfo);
+    ensureDataDir();
+    writeFileSync(getConnectionInfoPath(), connInfo);
   } catch {
-    try { writeFileSync(join(__dirname, '.connection-info.json'), connInfo); } catch {}
   }
 });

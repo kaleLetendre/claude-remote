@@ -1,0 +1,23 @@
+# Build artifacts and platform-specific files
+client/android/
+desktop/
+lifeline/
+data/
+.git/
+.github/
+
+# Dev files
+run.sh
+*.md
+!README.md
+.claude/
+.restart-requested
+
+# Dependencies (installed via postinstall)
+server/node_modules/
+client/node_modules/
+
+# Misc
+*.log
+.DS_Store
+.env

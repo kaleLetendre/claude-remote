@@ -2,10 +2,9 @@ import { spawn } from 'node-pty';
 import { EventEmitter } from 'events';
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
+import { getSessionsPath, ensureDataDir } from '../lib/paths.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SESSIONS_FILE = path.join(__dirname, '..', 'data', 'sessions.json');
+const SESSIONS_FILE = getSessionsPath();
 
 // ── Claude Code detection ───────────────────────────────────────────
 // Patterns that indicate Claude Code is the active process in this session.
@@ -87,8 +86,7 @@ export class SessionManager extends EventEmitter {
         createdAt: s.createdAt,
         lastActivity: s.lastActivity,
       }));
-      const dir = path.dirname(SESSIONS_FILE);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      ensureDataDir();
       fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
     } catch {}
   }
