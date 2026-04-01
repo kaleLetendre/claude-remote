@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import crypto from 'crypto';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..');
@@ -14,25 +15,25 @@ export const PATHS = {
 // ── Default settings by version ─────────────────────────────
 const DEFAULTS = {
   port: 3033,
-  authToken: null,        // null = generate random
+  authToken: null,        // null = generate random on first run, then persist
+  password: null,         // null = no password set; { hash, salt } when set
   shell: null,            // null = use $SHELL
   cols: 120,
   rows: 40,
   autoUpdate: false,
   updateCheckInterval: 300_000,  // 5 min
-  settingsVersion: 1,
+  settingsVersion: 2,
 };
 
 // ── Migrations ──────────────────────────────────────────────
 // Each migration takes the settings object and returns the upgraded version.
 // Keyed by the version they migrate FROM → TO.
 const MIGRATIONS = {
-  // Example: version 1 → 2
-  // 1: (settings) => {
-  //   settings.newField = 'default';
-  //   settings.settingsVersion = 2;
-  //   return settings;
-  // },
+  1: (settings) => {
+    settings.password = settings.password || null;
+    settings.settingsVersion = 2;
+    return settings;
+  },
 };
 
 // ── Load / Save / Migrate ───────────────────────────────────
@@ -93,6 +94,20 @@ function ensureDataDir() {
   if (!existsSync(dataDir)) {
     mkdirSync(dataDir, { recursive: true });
   }
+}
+
+// ── Password hashing ────────────────────────────────────────
+
+export function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return { hash, salt };
+}
+
+export function verifyPassword(password, stored) {
+  if (!stored || !stored.hash || !stored.salt) return false;
+  const hash = crypto.scryptSync(password, stored.salt, 64).toString('hex');
+  return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(stored.hash));
 }
 
 // ── Client settings schema ──────────────────────────────────

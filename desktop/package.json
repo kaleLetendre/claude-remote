@@ -1,0 +1,12 @@
+{
+  "name": "claude-remote-desktop",
+  "version": "0.1.0",
+  "description": "Claude Remote desktop app — tray icon and admin panel",
+  "main": "main.js",
+  "scripts": {
+    "start": "ELECTRON_DISABLE_SANDBOX=1 electron ."
+  },
+  "dependencies": {
+    "electron": "^33.0.0"
+  }
+}

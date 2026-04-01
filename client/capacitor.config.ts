@@ -3,12 +3,10 @@ import type { CapacitorConfig } from '@capacitor/cli';
 const config: CapacitorConfig = {
   appId: 'com.clauderemote.app',
   appName: 'Claude Remote',
-  webDir: 'www',
+  webDir: 'bootstrap',
   server: {
-    // For development: point to your server's LAN address
-    // Comment this out for production builds (will use bundled www/)
-    // url: 'http://192.168.1.42:3033',
-    cleartext: true,  // Allow HTTP (needed for local network)
+    cleartext: true,  // Allow HTTP (needed for local network / Tailscale)
+    allowNavigation: ['*'],  // Allow WebView to navigate to server URLs
   },
   plugins: {
     LocalNotifications: {

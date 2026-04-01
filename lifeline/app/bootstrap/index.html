@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>CR Lifeline</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: #0d0e14; color: #c0c8d8; font-family: 'Courier New', monospace; font-size: 14px; }
+  body { display: flex; align-items: center; justify-content: center; padding: 24px; }
+  .box { width: 100%; max-width: 340px; }
+  h1 { font-size: 18px; color: #60d070; margin-bottom: 4px; }
+  p { font-size: 12px; color: #606878; margin-bottom: 20px; }
+  label { display: block; font-size: 11px; color: #606878; text-transform: uppercase; margin-bottom: 4px; margin-top: 12px; }
+  input { width: 100%; font-family: inherit; font-size: 14px; background: #161820; border: 1px solid #2a2e3a; color: #c0c8d8; padding: 10px; border-radius: 4px; outline: none; }
+  input:focus { border-color: #60d070; }
+  button { width: 100%; margin-top: 16px; padding: 12px; font-family: inherit; font-size: 14px; font-weight: bold; background: #2a6040; color: #c0c8d8; border: 1px solid #3a8050; border-radius: 4px; cursor: pointer; }
+  .msg { font-size: 12px; margin-top: 8px; }
+  .err { color: #e06060; }
+  .ok { color: #60d070; }
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>CR Lifeline</h1>
+  <p>Emergency fallback terminal</p>
+  <label>Server URL</label>
+  <input type="url" id="url" placeholder="http://100.64.1.5:3034" autocapitalize="none" autocomplete="off">
+  <label>Password</label>
+  <input type="password" id="pw" placeholder="Password" autocapitalize="none">
+  <details style="margin-top:10px;"><summary style="font-size:11px;color:#606878;cursor:pointer;">Token</summary>
+    <input type="text" id="tk" placeholder="Token" style="margin-top:6px;" autocapitalize="none" autocomplete="off">
+  </details>
+  <button id="go">Connect</button>
+  <div class="msg" id="msg"></div>
+</div>
+<script>
+  const KEY = 'lifeline-creds';
+  try {
+    const s = JSON.parse(localStorage.getItem(KEY) || '{}');
+    if (s.url) document.getElementById('url').value = s.url;
+    if (s.url && s.token) autoConnect(s.url, s.token);
+  } catch {}
+
+  async function autoConnect(url, token) {
+    const msg = document.getElementById('msg');
+    msg.className = 'msg ok'; msg.textContent = 'Reconnecting...';
+    try {
+      const r = await fetch(`${url}/api/info?token=${token}`, { headers: { 'Authorization': `Bearer ${token}` } });
+      if (r.ok) { window.location.href = `${url}?token=${token}`; return; }
+    } catch {}
+    msg.textContent = '';
+  }
+
+  document.getElementById('go').onclick = async () => {
+    const url = document.getElementById('url').value.trim().replace(/\/+$/, '');
+    const pw = document.getElementById('pw').value.trim();
+    const tk = document.getElementById('tk').value.trim();
+    const msg = document.getElementById('msg');
+    if (!url) { msg.className = 'msg err'; msg.textContent = 'URL required'; return; }
+    if (!pw && !tk) { msg.className = 'msg err'; msg.textContent = 'Enter password or token'; return; }
+    msg.className = 'msg ok'; msg.textContent = 'Connecting...';
+    try {
+      let token = '';
+      if (pw) {
+        const r = await fetch(`${url}/api/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: pw }) });
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'Failed');
+        token = (await r.json()).token;
+      } else { token = tk; }
+      const r = await fetch(`${url}/api/info?token=${token}`, { headers: { 'Authorization': `Bearer ${token}` } });
+      if (!r.ok) throw new Error('Auth failed');
+      localStorage.setItem(KEY, JSON.stringify({ url, token }));
+      window.location.href = `${url}?token=${token}`;
+    } catch (e) { msg.className = 'msg err'; msg.textContent = e.message; }
+  };
+  document.querySelectorAll('input').forEach(i => i.addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('go').click(); }));
+</script>
+</body>
+</html>

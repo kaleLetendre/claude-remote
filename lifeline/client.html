@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>CR Lifeline</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: #0d0e14; color: #c0c8d8; font-family: 'Courier New', monospace; font-size: 14px; }
+  body { display: flex; flex-direction: column; }
+  #auth-screen, #session-screen, #term-screen { display: none; flex-direction: column; height: 100%; }
+  .active { display: flex !important; }
+
+  /* Auth */
+  #auth-screen { align-items: center; justify-content: center; padding: 24px; }
+  .auth-box { width: 100%; max-width: 340px; }
+  .auth-box h1 { font-size: 18px; color: #60d070; margin-bottom: 4px; }
+  .auth-box p { font-size: 12px; color: #606878; margin-bottom: 20px; }
+  .auth-box label { display: block; font-size: 11px; color: #606878; text-transform: uppercase; margin-bottom: 4px; margin-top: 12px; }
+  .auth-box input { width: 100%; font-family: inherit; font-size: 14px; background: #161820; border: 1px solid #2a2e3a; color: #c0c8d8; padding: 10px; border-radius: 4px; outline: none; }
+  .auth-box input:focus { border-color: #60d070; }
+  .auth-box button { width: 100%; margin-top: 16px; padding: 12px; font-family: inherit; font-size: 14px; font-weight: bold; background: #2a6040; color: #c0c8d8; border: 1px solid #3a8050; border-radius: 4px; cursor: pointer; }
+  .auth-box .msg { font-size: 12px; margin-top: 8px; }
+  .err { color: #e06060; }
+
+  /* Sessions */
+  #session-screen { padding: 16px; }
+  #session-screen h2 { font-size: 14px; color: #60d070; margin-bottom: 12px; }
+  .sess-btn { display: block; width: 100%; text-align: left; padding: 10px; margin-bottom: 6px; background: #161820; border: 1px solid #2a2e3a; color: #c0c8d8; font-family: inherit; font-size: 13px; border-radius: 4px; cursor: pointer; }
+  .sess-btn:hover { border-color: #60d070; }
+  .new-sess { background: #1a2a20; border-color: #3a8050; color: #60d070; font-weight: bold; margin-top: 8px; }
+  .note { font-size: 11px; color: #404858; margin-top: 16px; line-height: 1.5; }
+
+  /* Terminal */
+  #term-screen { height: 100%; }
+  .term-header { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: #161820; border-bottom: 1px solid #2a2e3a; flex-shrink: 0; }
+  .term-header a { color: #60d070; font-size: 12px; text-decoration: none; cursor: pointer; }
+  .term-header span { color: #606878; font-size: 12px; flex: 1; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #output { flex: 1; overflow-y: auto; padding: 8px 12px; white-space: pre-wrap; word-wrap: break-word; font-size: 13px; line-height: 1.4; background: #0d0e14; }
+  .quick-row { display: flex; gap: 4px; padding: 4px 8px; background: #161820; border-top: 1px solid #2a2e3a; flex-shrink: 0; overflow-x: auto; }
+  .qb { padding: 6px 10px; font-family: inherit; font-size: 12px; background: #1a1e28; border: 1px solid #2a2e3a; color: #808898; border-radius: 3px; cursor: pointer; white-space: nowrap; }
+  .qb:active { background: #2a3040; }
+  .input-row { display: flex; gap: 4px; padding: 8px; background: #161820; border-top: 1px solid #2a2e3a; flex-shrink: 0; }
+  .input-row input { flex: 1; font-family: inherit; font-size: 14px; background: #0d0e14; border: 1px solid #2a2e3a; color: #c0c8d8; padding: 10px; border-radius: 4px; outline: none; }
+  .input-row input:focus { border-color: #60d070; }
+  .input-row button { padding: 10px 16px; font-family: inherit; font-size: 13px; font-weight: bold; background: #2a6040; color: #c0c8d8; border: 1px solid #3a8050; border-radius: 4px; cursor: pointer; }
+</style>
+</head>
+<body>
+
+<!-- Auth Screen -->
+<div id="auth-screen" class="active">
+  <div class="auth-box">
+    <h1>CR Lifeline</h1>
+    <p>Emergency fallback terminal</p>
+    <label>Server URL</label>
+    <input type="url" id="a-url" placeholder="http://100.64.1.5:3034" autocapitalize="none" autocomplete="off">
+    <label>Password</label>
+    <input type="password" id="a-pw" placeholder="Password" autocapitalize="none">
+    <details style="margin-top:10px;"><summary style="font-size:11px;color:#606878;cursor:pointer;">Token</summary>
+      <input type="text" id="a-token" placeholder="Token" style="margin-top:6px;" autocapitalize="none" autocomplete="off">
+    </details>
+    <button id="a-go">Connect</button>
+    <div class="msg" id="a-msg"></div>
+  </div>
+</div>
+
+<!-- Session List -->
+<div id="session-screen">
+  <h2>Lifeline Sessions</h2>
+  <div id="sess-list"></div>
+  <button class="sess-btn new-sess" id="new-sess">+ New Session</button>
+  <div class="note">Plain text mode. TUI programs (vim, htop) won't render correctly.<br>Use for: git, npm, systemctl, ls, cat, etc.</div>
+</div>
+
+<!-- Terminal -->
+<div id="term-screen">
+  <div class="term-header">
+    <a id="back-btn">&larr; Back</a>
+    <span id="term-cwd"></span>
+  </div>
+  <pre id="output"></pre>
+  <div class="quick-row">
+    <button class="qb" data-d="&#3;">Ctrl+C</button>
+    <button class="qb" data-d="&#4;">Ctrl+D</button>
+    <button class="qb" data-d="&#9;">Tab</button>
+    <button class="qb" data-d="&#27;[A">Up</button>
+    <button class="qb" data-d="&#27;[B">Down</button>
+    <button class="qb" data-d="\n">Enter</button>
+  </div>
+  <div class="input-row">
+    <input type="text" id="cmd" placeholder="Type command..." autocapitalize="none" autocomplete="off" autocorrect="off" spellcheck="false">
+    <button id="send">Send</button>
+  </div>
+</div>
+
+<script>
+const STORE_KEY = 'lifeline-settings';
+let ws = null, token = '', baseUrl = '', currentSession = null;
+
+// ── Screens ──
+function show(id) {
+  document.querySelectorAll('#auth-screen,#session-screen,#term-screen').forEach(e => e.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
+
+// ── ANSI strip ──
+function stripAnsi(s) {
+  return s.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '').replace(/\x1b[()][AB012]/g, '').replace(/\r/g, '');
+}
+
+// ── API ──
+async function api(path, opts = {}) {
+  const sep = path.includes('?') ? '&' : '?';
+  return fetch(`${baseUrl}/api${path}${sep}token=${token}`, {
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', ...opts.headers }, ...opts
+  });
+}
+
+// ── Auth ──
+const params = new URLSearchParams(location.search);
+try {
+  const saved = JSON.parse(localStorage.getItem(STORE_KEY) || '{}');
+  if (saved.url) document.getElementById('a-url').value = saved.url;
+  if (saved.url && saved.token) { baseUrl = saved.url; token = saved.token; autoConnect(); }
+} catch {}
+if (params.get('token')) {
+  token = params.get('token');
+  baseUrl = location.origin;
+  localStorage.setItem(STORE_KEY, JSON.stringify({ url: baseUrl, token }));
+  history.replaceState(null, '', '/');
+  loadSessions();
+}
+
+async function autoConnect() {
+  try {
+    const r = await api('/info');
+    if (r.ok) { loadSessions(); return; }
+  } catch {}
+  show('auth-screen');
+}
+
+document.getElementById('a-go').onclick = async () => {
+  const url = document.getElementById('a-url').value.trim().replace(/\/+$/, '');
+  const pw = document.getElementById('a-pw').value.trim();
+  const tk = document.getElementById('a-token').value.trim();
+  const msg = document.getElementById('a-msg');
+  if (!url) { msg.className = 'msg err'; msg.textContent = 'URL required'; return; }
+  msg.textContent = 'Connecting...';
+  try {
+    if (pw) {
+      const r = await fetch(`${url}/api/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: pw }) });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'Login failed');
+      token = (await r.json()).token;
+    } else if (tk) {
+      token = tk;
+    } else { msg.className = 'msg err'; msg.textContent = 'Enter password or token'; return; }
+    baseUrl = url;
+    const r = await api('/info');
+    if (!r.ok) throw new Error('Auth failed');
+    localStorage.setItem(STORE_KEY, JSON.stringify({ url: baseUrl, token }));
+    loadSessions();
+  } catch (e) { msg.className = 'msg err'; msg.textContent = e.message; }
+};
+document.querySelectorAll('#auth-screen input').forEach(i => i.addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('a-go').click(); }));
+
+// ── Sessions ──
+async function loadSessions() {
+  show('session-screen');
+  try {
+    const r = await api('/sessions');
+    const list = await r.json();
+    const el = document.getElementById('sess-list');
+    el.innerHTML = '';
+    if (list.length === 0) {
+      el.innerHTML = '<div style="color:#606878;font-size:12px;margin-bottom:8px;">No sessions</div>';
+    }
+    list.forEach(s => {
+      const btn = document.createElement('button');
+      btn.className = 'sess-btn';
+      btn.textContent = `${s.id}  ${s.cwd}`;
+      btn.onclick = () => openSession(s.id, s.cwd);
+      el.appendChild(btn);
+    });
+  } catch {}
+}
+
+document.getElementById('new-sess').onclick = async () => {
+  try {
+    const r = await api('/sessions', { method: 'POST', body: JSON.stringify({}) });
+    const s = await r.json();
+    openSession(s.id, s.cwd);
+  } catch {}
+};
+
+// ── Terminal ──
+function openSession(id, cwd) {
+  currentSession = id;
+  document.getElementById('output').textContent = '';
+  document.getElementById('term-cwd').textContent = cwd || '';
+  show('term-screen');
+  connectWS(id);
+  document.getElementById('cmd').focus();
+}
+
+document.getElementById('back-btn').onclick = () => {
+  if (ws) { ws.close(); ws = null; }
+  currentSession = null;
+  loadSessions();
+};
+
+function connectWS(sessionId) {
+  if (ws) ws.close();
+  const url = new URL(baseUrl);
+  const wsUrl = `ws://${url.host}?token=${token}`;
+  ws = new WebSocket(wsUrl);
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ type: 'subscribe', sessionId }));
+  };
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'output') {
+      const out = document.getElementById('output');
+      out.textContent += stripAnsi(msg.data);
+      out.scrollTop = out.scrollHeight;
+    }
+    if (msg.type === 'session:exit') {
+      document.getElementById('output').textContent += '\n[session ended]\n';
+    }
+  };
+  ws.onclose = () => {
+    if (currentSession === sessionId) setTimeout(() => connectWS(sessionId), 3000);
+  };
+}
+
+// Input
+document.getElementById('send').onclick = () => {
+  const input = document.getElementById('cmd');
+  if (ws && ws.readyState === 1 && currentSession) {
+    ws.send(JSON.stringify({ type: 'input', sessionId: currentSession, data: input.value + '\n' }));
+  }
+  input.value = '';
+  input.focus();
+};
+document.getElementById('cmd').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); document.getElementById('send').click(); }
+});
+
+// Quick buttons
+document.querySelectorAll('.qb').forEach(btn => {
+  btn.onclick = () => {
+    if (ws && ws.readyState === 1 && currentSession) {
+      ws.send(JSON.stringify({ type: 'input', sessionId: currentSession, data: btn.dataset.d }));
+    }
+  };
+});
+</script>
+</body>
+</html>

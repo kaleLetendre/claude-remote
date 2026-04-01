@@ -1,8 +1,14 @@
 # Dependencies
 node_modules/
 
-# Capacitor generated
-client/android/
+# Capacitor generated (ignore build artifacts, keep native source)
+client/android/*
+!client/android/app/
+client/android/app/*
+!client/android/app/src/
+!client/android/app/build.gradle
+client/android/app/build/
+lifeline/app/android/
 
 # User data (persisted across updates)
 data/*

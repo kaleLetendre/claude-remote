@@ -3,18 +3,27 @@ import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import { readFileSync, writeFileSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, statSync } from 'fs';
 import crypto from 'crypto';
 import os from 'os';
 import { SessionManager } from './sessions.js';
 import { Updater } from './updater.js';
+import { loadServerSettings, saveServerSettings, hashPassword, verifyPassword } from './settings.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// ── Config ──────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3033;
-const AUTH_TOKEN = process.env.AUTH_TOKEN || crypto.randomBytes(16).toString('hex');
-const AUTO_UPDATE = process.env.AUTO_UPDATE === 'true';
+// ── Config (persistent) ────────────────────────────────────────────
+const settings = loadServerSettings();
+
+// Generate and persist auth token on first run
+if (!settings.authToken) {
+  settings.authToken = crypto.randomBytes(16).toString('hex');
+  saveServerSettings(settings);
+}
+
+const PORT = settings.port;
+const AUTH_TOKEN = settings.authToken;
+const AUTO_UPDATE = settings.autoUpdate;
 
 // ── App Setup ───────────────────────────────────────────────────────
 const app = express();
@@ -32,8 +41,22 @@ updater.on('update-available', (info) => {
 
 app.use(express.json());
 
+// CORS — allow Capacitor WebView (capacitor://localhost) and any origin
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.header('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 // Serve client from sibling directory
 app.use(express.static(join(__dirname, '..', 'client', 'www')));
+
+// Admin page (clean URL)
+app.get('/admin', (req, res) => {
+  res.sendFile(join(__dirname, '..', 'client', 'www', 'admin.html'));
+});
 
 // ── Auth middleware ──────────────────────────────────────────────────
 function authCheck(req, res, next) {
@@ -44,6 +67,22 @@ function authCheck(req, res, next) {
   }
   next();
 }
+
+// ── Auth endpoints (no authCheck — these exchange password for token) ──
+
+app.post('/api/auth/login', (req, res) => {
+  const { password } = req.body || {};
+  if (!password) {
+    return res.status(400).json({ error: 'Password required' });
+  }
+  if (!settings.password) {
+    return res.status(400).json({ error: 'No password set — use token auth or set a password from the admin panel' });
+  }
+  if (!verifyPassword(password, settings.password)) {
+    return res.status(401).json({ error: 'Wrong password' });
+  }
+  res.json({ token: AUTH_TOKEN });
+});
 
 // ── REST API ────────────────────────────────────────────────────────
 
@@ -77,6 +116,16 @@ app.patch('/api/sessions/:id', authCheck, (req, res) => {
     res.json(session);
   } catch (err) {
     res.status(404).json({ error: err.message });
+  }
+});
+
+// Reconnect a dead session (spawns new pty in same directory)
+app.post('/api/sessions/:id/reconnect', authCheck, (req, res) => {
+  try {
+    const session = sessions.reconnect(req.params.id);
+    res.json(session);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
 });
 
@@ -149,6 +198,60 @@ app.post('/api/restart', authCheck, (req, res) => {
   updater.scheduleRestart(2000);
 });
 
+// ── APK distribution ───────────────────────────────────────────────
+
+const APK_PATH = join(__dirname, '..', 'client', 'android', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
+
+// Check app version (unauthenticated — so the bootstrap screen can check)
+app.get('/api/app/version', (req, res) => {
+  try {
+    const ver = JSON.parse(readFileSync(join(__dirname, '..', 'version.json'), 'utf8'));
+    const hasApk = existsSync(APK_PATH);
+    let apkSize = null;
+    if (hasApk) {
+      apkSize = statSync(APK_PATH).size;
+    }
+    res.json({ version: ver.version, hasApk, apkSize });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Download APK
+app.get('/api/app/download', (req, res) => {
+  if (!existsSync(APK_PATH)) {
+    return res.status(404).json({ error: 'APK not built. Run: cd client/android && ./gradlew assembleDebug' });
+  }
+  res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+  res.setHeader('Content-Disposition', 'attachment; filename="claude-remote.apk"');
+  res.download(APK_PATH, 'claude-remote.apk');
+});
+
+// ── Admin API ──────────────────────────────────────────────────────
+
+// Set or change password
+app.post('/api/admin/password', authCheck, (req, res) => {
+  const { password } = req.body || {};
+  if (!password || password.length < 1) {
+    return res.status(400).json({ error: 'Password required' });
+  }
+  settings.password = hashPassword(password);
+  saveServerSettings(settings);
+  res.json({ ok: true, message: 'Password set' });
+});
+
+// Remove password (revert to token-only auth)
+app.delete('/api/admin/password', authCheck, (req, res) => {
+  settings.password = null;
+  saveServerSettings(settings);
+  res.json({ ok: true, message: 'Password removed' });
+});
+
+// Get current auth token (for sharing with new devices)
+app.get('/api/admin/token', authCheck, (req, res) => {
+  res.json({ token: AUTH_TOKEN });
+});
+
 // Client settings schema (for migrations)
 app.get('/api/settings-schema', authCheck, (req, res) => {
   try {
@@ -164,6 +267,26 @@ app.get('/api/settings-schema', authCheck, (req, res) => {
 
 // ── WebSocket ───────────────────────────────────────────────────────
 const wss = new WebSocketServer({ server });
+const connectedClients = new Map(); // ws → { ip, connectedAt, subscribedSession }
+
+// Admin status endpoint
+app.get('/api/admin/status', authCheck, (req, res) => {
+  const clients = [];
+  for (const [, info] of connectedClients) {
+    clients.push({ ip: info.ip, connectedAt: info.connectedAt, subscribedSession: info.subscribedSession });
+  }
+  res.json({
+    hostname: os.hostname(),
+    platform: os.platform(),
+    uptime: process.uptime(),
+    port: PORT,
+    version: updater.getVersion(),
+    passwordSet: !!settings.password,
+    clients,
+    sessions: sessions.list(),
+    ips: detectIPs(),
+  });
+});
 
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -174,6 +297,9 @@ wss.on('connection', (ws, req) => {
     ws.close(4001, 'Unauthorized');
     return;
   }
+
+  const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  connectedClients.set(ws, { ip: clientIp, connectedAt: Date.now(), subscribedSession: null });
 
   let subscribedSession = null;
 
@@ -190,6 +316,9 @@ wss.on('connection', (ws, req) => {
           }
           sessions.subscribe(msg.sessionId, ws);
           subscribedSession = msg.sessionId;
+          const clientInfo = connectedClients.get(ws);
+          if (clientInfo) clientInfo.subscribedSession = msg.sessionId;
+          console.log(`[ws] client subscribed to ${msg.sessionId}`);
           ws.send(JSON.stringify({ type: 'subscribed', sessionId: msg.sessionId }));
           break;
         }
@@ -205,6 +334,7 @@ wss.on('connection', (ws, req) => {
 
         // Send input to a session
         case 'input': {
+          console.log(`[ws] input to ${msg.sessionId}: ${JSON.stringify(msg.data).slice(0, 50)}`);
           sessions.write(msg.sessionId, msg.data);
           break;
         }
@@ -233,6 +363,7 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     sessions.unsubscribeAll(ws);
+    connectedClients.delete(ws);
   });
 
   // Send initial session list
@@ -251,6 +382,16 @@ function broadcastSessionList() {
 sessions.on('session:created', broadcastSessionList);
 sessions.on('session:killed', broadcastSessionList);
 sessions.on('session:exit', broadcastSessionList);
+sessions.on('session:reconnected', broadcastSessionList);
+
+// Broadcast attention events to ALL connected clients (not just session subscribers)
+// so phones get notifications even when on the dashboard or recently reconnected
+sessions.on('session:attention', (sessionId, reason, preview) => {
+  const msg = JSON.stringify({ type: 'session:attention', sessionId, reason, preview });
+  for (const client of wss.clients) {
+    if (client.readyState === 1) client.send(msg);
+  }
+});
 
 // Periodic status broadcast (so dashboard stays fresh)
 setInterval(() => {

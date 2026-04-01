@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>Claude Remote</title>
+  <meta name="app-version" content="0.2.0">
+  <style>
+    :root {
+      --bg-0: #0b0c10; --bg-2: #1a1c26;
+      --border-1: #2d3048;
+      --text-0: #e4e6f0; --text-2: #7a7f9a; --text-3: #4e526a;
+      --accent: #a080f0; --red: #f06070; --green: #4ae08c;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-family: -apple-system, system-ui, sans-serif; font-size: 15px; }
+    body { display: flex; align-items: center; justify-content: center; padding: 24px; }
+    .container { width: 100%; max-width: 360px; text-align: center; }
+    .logo { font-size: 48px; opacity: 0.3; margin-bottom: 16px; }
+    h1 { font-size: 22px; font-weight: 700; margin-bottom: 6px; }
+    .sub { color: var(--text-2); margin-bottom: 28px; line-height: 1.5; }
+    .form { text-align: left; }
+    .label { display: block; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-3); margin-bottom: 6px; margin-top: 14px; }
+    .input { width: 100%; font-size: 15px; background: var(--bg-2); border: 1px solid var(--border-1); border-radius: 8px; padding: 12px; color: var(--text-0); outline: none; }
+    .input:focus { border-color: var(--accent); }
+    .btn { width: 100%; font-size: 15px; font-weight: 600; background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 14px; margin-top: 20px; cursor: pointer; }
+    .btn:active { opacity: 0.85; }
+    .btn:disabled { opacity: 0.5; }
+    .msg { font-size: 13px; margin-top: 10px; text-align: center; }
+    .msg.err { color: var(--red); }
+    .msg.ok { color: var(--green); }
+    .advanced { margin-top: 16px; }
+    .advanced summary { cursor: pointer; font-size: 13px; color: var(--text-3); }
+    .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 0.6s linear infinite; vertical-align: middle; margin-right: 6px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    /* Full-screen iframe for the server app */
+    #app-frame {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      border: none; z-index: 10000; display: none;
+      background: var(--bg-0);
+    }
+    body.app-loaded { padding: 0; overflow: hidden; }
+    body.app-loaded .container { display: none; }
+    body.app-loaded #app-frame { display: block; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="logo">&#x2318;</div>
+    <h1>Claude Remote</h1>
+    <p class="sub">Connect to your workstation</p>
+    <div class="form">
+      <label class="label">Server URL</label>
+      <input type="url" class="input" id="url" placeholder="http://100.64.1.5:3033">
+      <label class="label">Password</label>
+      <input type="password" class="input" id="password" placeholder="Enter password">
+      <button class="btn" id="go">Connect</button>
+      <details class="advanced">
+        <summary>Advanced: connect with token</summary>
+        <label class="label">Auth Token</label>
+        <input type="text" class="input" id="token" placeholder="abc123...">
+      </details>
+      <p class="msg" id="msg"></p>
+    </div>
+  </div>
+
+  <!-- Full-screen iframe for the server app (keeps bootstrap alive for Capacitor plugins) -->
+  <iframe id="app-frame" allow="microphone; notifications"></iframe>
+
+  <script>
+    const STORAGE_KEY = 'claude-remote-settings';
+    let _serverUrl = '';
+    let _authToken = '';
+    let _pollInterval = null;
+    let _lastAttention = {};  // sessionId -> timestamp, to avoid duplicate notifications
+
+    // ── Capacitor Local Notifications ────────────────────────
+    // Available because we stay on the bootstrap page (Capacitor bridge intact)
+    const LocalNotifications = window.Capacitor?.Plugins?.LocalNotifications;
+    const Haptics = window.Capacitor?.Plugins?.Haptics;
+
+    async function initNotifications() {
+      if (!LocalNotifications) {
+        console.log('[notif] Capacitor LocalNotifications not available, falling back to Web API');
+        return;
+      }
+      try {
+        const perm = await LocalNotifications.checkPermissions();
+        if (perm.display !== 'granted') {
+          await LocalNotifications.requestPermissions();
+        }
+
+        // Set up notification action listeners (tap to open session)
+        LocalNotifications.addListener('localNotificationActionPerformed', (action) => {
+          const data = action.notification?.extra;
+          if (data?.sessionId) {
+            // Tell the iframe to navigate to this session
+            const frame = document.getElementById('app-frame');
+            if (frame?.contentWindow) {
+              frame.contentWindow.postMessage({
+                type: 'navigate-session',
+                sessionId: data.sessionId,
+                sessionName: data.sessionName,
+              }, '*');
+            }
+          }
+        });
+
+        console.log('[notif] Capacitor LocalNotifications ready');
+      } catch (e) {
+        console.log('[notif] Failed to init:', e);
+      }
+    }
+
+    async function fireNotification(sessionId, name, reason, preview) {
+      // Vibrate
+      if (Haptics) {
+        try {
+          if (reason === 'prompt') {
+            await Haptics.vibrate({ duration: 300 });
+          } else {
+            await Haptics.vibrate({ duration: 100 });
+          }
+        } catch {}
+      }
+
+      const title = reason === 'prompt'
+        ? `${name} needs input`
+        : `${name} — done`;
+      const body = reason === 'prompt'
+        ? (preview ? preview.slice(0, 120) : 'Claude is waiting for your response')
+        : 'Output finished';
+
+      if (LocalNotifications) {
+        try {
+          await LocalNotifications.schedule({
+            notifications: [{
+              title,
+              body,
+              id: Math.floor(Math.random() * 100000),
+              schedule: { at: new Date(Date.now() + 100) },  // near-immediate
+              sound: 'default',
+              extra: { sessionId, sessionName: name },
+            }],
+          });
+          return;
+        } catch (e) {
+          console.log('[notif] Capacitor notification failed:', e);
+        }
+      }
+
+      // Fallback: Web Notification API (may work in some contexts)
+      try {
+        if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+          new Notification(title, { body, tag: `claude-${reason}-${sessionId}`, renotify: true });
+        }
+      } catch {}
+    }
+
+    // ── Background Polling for Attention Events ──────────────
+    // Polls the server REST API to detect attention events.
+    // This runs in the bootstrap page (never navigated away) so it stays alive
+    // even when the iframe's WebSocket disconnects on backgrounding.
+
+    function startAttentionPoller() {
+      if (_pollInterval) clearInterval(_pollInterval);
+      _pollInterval = setInterval(pollAttention, 4000);
+      console.log('[notif] Attention poller started');
+    }
+
+    function stopAttentionPoller() {
+      if (_pollInterval) {
+        clearInterval(_pollInterval);
+        _pollInterval = null;
+      }
+    }
+
+    async function pollAttention() {
+      if (!_serverUrl || !_authToken) return;
+      try {
+        const res = await fetch(`${_serverUrl}/api/sessions`, {
+          headers: { 'Authorization': `Bearer ${_authToken}` },
+        });
+        if (!res.ok) return;
+        const sessions = await res.json();
+
+        for (const s of sessions) {
+          if (s.attentionReason && s.attentionAt) {
+            const lastFired = _lastAttention[s.id] || 0;
+            // Only fire if this is a new attention event (timestamp changed)
+            if (s.attentionAt > lastFired) {
+              _lastAttention[s.id] = s.attentionAt;
+              const name = s.name || 'Session';
+              fireNotification(s.id, name, s.attentionReason, s.attentionPreview);
+            }
+          }
+        }
+      } catch {}
+    }
+
+    // ── Login / Connection ───────────────────────────────────
+    // Load saved settings
+    try {
+      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+      if (saved.serverUrl) document.getElementById('url').value = saved.serverUrl;
+      // Auto-connect if we have saved credentials
+      if (saved.serverUrl && saved.token) {
+        autoConnect(saved.serverUrl, saved.token);
+      }
+    } catch {}
+
+    async function autoConnect(url, token) {
+      const msg = document.getElementById('msg');
+      msg.className = 'msg ok';
+      msg.innerHTML = '<span class="spinner"></span>Reconnecting...';
+      try {
+        const res = await fetch(`${url}/api/info?token=${token}`, {
+          headers: { 'Authorization': `Bearer ${token}` },
+        });
+        if (res.ok) {
+          msg.innerHTML = '<span class="spinner"></span>Loading app...';
+          loadServerApp(url, token);
+          return;
+        }
+      } catch {}
+      // Failed — let user re-enter credentials
+      msg.className = 'msg';
+      msg.textContent = '';
+    }
+
+    document.getElementById('go').onclick = async () => {
+      const url = document.getElementById('url').value.trim().replace(/\/+$/, '');
+      const password = document.getElementById('password').value.trim();
+      const tokenInput = document.getElementById('token').value.trim();
+      const msg = document.getElementById('msg');
+      const btn = document.getElementById('go');
+
+      if (!url) { msg.className = 'msg err'; msg.textContent = 'Server URL required'; return; }
+      if (!password && !tokenInput) { msg.className = 'msg err'; msg.textContent = 'Enter password or token'; return; }
+
+      btn.disabled = true;
+      msg.className = 'msg ok';
+      msg.innerHTML = '<span class="spinner"></span>Connecting...';
+
+      try {
+        let token = '';
+
+        // Exchange password for token (password takes priority)
+        if (password) {
+          const loginRes = await fetch(`${url}/api/auth/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password }),
+          });
+          if (!loginRes.ok) {
+            const e = await loginRes.json().catch(() => ({}));
+            throw new Error(e.error || 'Login failed');
+          }
+          token = (await loginRes.json()).token;
+        } else if (tokenInput) {
+          token = tokenInput;
+        }
+
+        // Verify token works
+        const res = await fetch(`${url}/api/info?token=${token}`, {
+          headers: { 'Authorization': `Bearer ${token}` },
+        });
+        if (!res.ok) throw new Error('Auth failed');
+
+        // Save credentials
+        const settings = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+        settings.serverUrl = url;
+        settings.token = token;
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+
+        // Check for APK update
+        const update = await checkAppUpdate(url);
+        if (update) {
+          showUpdatePrompt(url, update, token);
+          btn.disabled = false;
+          return;
+        }
+
+        msg.innerHTML = '<span class="spinner"></span>Loading app...';
+        loadServerApp(url, token);
+
+      } catch (e) {
+        msg.className = 'msg err';
+        msg.textContent = e.message || 'Connection failed';
+        btn.disabled = false;
+      }
+    };
+
+    // Allow Enter to submit
+    document.querySelectorAll('.input').forEach(input => {
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') document.getElementById('go').click();
+      });
+    });
+
+    const APP_VERSION = document.querySelector('meta[name="app-version"]').content;
+
+    async function checkAppUpdate(url) {
+      try {
+        const res = await fetch(`${url}/api/app/version`);
+        if (!res.ok) return null;
+        const data = await res.json();
+        if (data.version && data.version !== APP_VERSION && data.hasApk) {
+          return data;
+        }
+      } catch {}
+      return null;
+    }
+
+    function showUpdatePrompt(url, updateInfo, token) {
+      const msg = document.getElementById('msg');
+      const size = updateInfo.apkSize ? ` (${(updateInfo.apkSize / 1024 / 1024).toFixed(1)} MB)` : '';
+      msg.className = 'msg';
+      msg.innerHTML = `
+        <div style="margin-top:16px;padding:14px;background:var(--bg-2);border-radius:8px;text-align:left;">
+          <div style="font-weight:600;margin-bottom:6px;">App update available</div>
+          <div style="color:var(--text-2);font-size:13px;margin-bottom:12px;">${APP_VERSION} &rarr; ${updateInfo.version}${size}</div>
+          <div style="display:flex;gap:8px;">
+            <button id="btn-update" style="flex:1;padding:10px;font-weight:600;background:var(--accent);color:#fff;border:none;border-radius:6px;cursor:pointer;">Download Update</button>
+            <button id="btn-skip" style="flex:1;padding:10px;font-weight:600;background:var(--bg-2);color:var(--text-2);border:1px solid var(--border-1);border-radius:6px;cursor:pointer;">Skip</button>
+          </div>
+        </div>
+      `;
+      document.getElementById('btn-update').onclick = () => {
+        if (window.NativeBridge) {
+          try { window.NativeBridge.openInBrowser(`${url}/api/app/download`); } catch {}
+        } else {
+          window.open(`${url}/api/app/download`, '_blank');
+        }
+      };
+      document.getElementById('btn-skip').onclick = () => {
+        loadServerApp(url, token);
+      };
+    }
+
+    // ── Load Server App in iframe ────────────────────────────
+    // Instead of navigating away (which kills the Capacitor bridge),
+    // load the server app in a full-screen iframe. The bootstrap page
+    // stays alive and can fire native Local Notifications.
+
+    function loadServerApp(url, token) {
+      _serverUrl = url;
+      _authToken = token;
+
+      const frame = document.getElementById('app-frame');
+      frame.src = `${url}?token=${token}&v=${APP_VERSION}`;
+      document.body.classList.add('app-loaded');
+
+      // Initialize Capacitor notifications (for tap-to-open handling)
+      initNotifications();
+
+      // Start native foreground service for background notifications.
+      // If available, it replaces the JS poller entirely (avoids duplicate notifications).
+      if (window.NativeBridge) {
+        try {
+          window.NativeBridge.startPollerService(url, token);
+          console.log('[notif] Native poller started, skipping JS poller');
+        } catch (e) {
+          console.log('[notif] Native poller failed, falling back to JS poller:', e);
+          startAttentionPoller();
+          seedAttentionState();
+        }
+      } else {
+        // No native bridge (e.g. running in browser) — use JS poller
+        startAttentionPoller();
+        seedAttentionState();
+      }
+    }
+
+    async function seedAttentionState() {
+      // Fetch current sessions so we don't fire stale notifications on connect
+      try {
+        const res = await fetch(`${_serverUrl}/api/sessions`, {
+          headers: { 'Authorization': `Bearer ${_authToken}` },
+        });
+        if (!res.ok) return;
+        const sessions = await res.json();
+        for (const s of sessions) {
+          if (s.attentionAt) {
+            _lastAttention[s.id] = s.attentionAt;
+          }
+        }
+      } catch {}
+    }
+
+    // Listen for messages from the iframe (e.g., logout, download)
+    window.addEventListener('message', (e) => {
+      if (e.data?.type === 'logout') {
+        stopAttentionPoller();
+        if (window.NativeBridge) {
+          try { window.NativeBridge.stopPollerService(); } catch {}
+        }
+        _serverUrl = '';
+        _authToken = '';
+        document.body.classList.remove('app-loaded');
+        document.getElementById('app-frame').src = '';
+      }
+      if (e.data?.type === 'download-apk' && e.data.url) {
+        // Open download URL in system browser
+        if (window.NativeBridge) {
+          try { window.NativeBridge.openInBrowser(e.data.url); } catch {}
+        } else {
+          window.open(e.data.url, '_blank');
+        }
+      }
+    });
+  </script>
+</body>
+</html>

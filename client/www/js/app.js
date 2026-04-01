@@ -28,7 +28,6 @@ const state = {
   recognition: null,
   xterm: null,
   fitAddon: null,
-  cleanBuffer: '',
   ttsAccum: '',
   ttsTimer: null,
 };
@@ -81,6 +80,60 @@ function timeAgo(ts) {
   return Math.floor(diff / 86400_000) + 'd ago';
 }
 
+// ── Momentum Scroll ───────────────────────────────────────
+// Adds inertial "throw" scrolling to any element.
+// Tracks touch velocity, continues with deceleration on release.
+// Additive: flicking again while coasting adds to the velocity.
+function enableMomentumScroll(el, { getScrollPos, setScrollPos }) {
+  let velocity = 0;
+  let lastY = 0;
+  let lastTime = 0;
+  let animFrame = null;
+  let tracking = false;
+
+  const friction = 0.94;   // per-frame multiplier (higher = longer coast)
+  const minVelocity = 0.5; // stop threshold
+
+  el.addEventListener('touchstart', (e) => {
+    tracking = true;
+    // Don't kill existing velocity entirely — let additive work
+    velocity *= 0.3;
+    if (animFrame) { cancelAnimationFrame(animFrame); animFrame = null; }
+    lastY = e.touches[0].clientY;
+    lastTime = performance.now();
+  }, { passive: true });
+
+  el.addEventListener('touchmove', (e) => {
+    if (!tracking) return;
+    const now = performance.now();
+    const y = e.touches[0].clientY;
+    const dt = now - lastTime || 1;
+    const dy = lastY - y; // positive = scroll down
+
+    // Scroll immediately
+    setScrollPos(getScrollPos() + dy);
+
+    // Track velocity (pixels per ms, smoothed)
+    velocity = 0.7 * (dy / dt) + 0.3 * velocity;
+    lastY = y;
+    lastTime = now;
+  }, { passive: true });
+
+  el.addEventListener('touchend', () => {
+    tracking = false;
+    // Convert to pixels per frame (~16ms)
+    velocity *= 16;
+    coast();
+  }, { passive: true });
+
+  function coast() {
+    if (Math.abs(velocity) < minVelocity) { velocity = 0; return; }
+    setScrollPos(getScrollPos() + velocity);
+    velocity *= friction;
+    animFrame = requestAnimationFrame(coast);
+  }
+}
+
 function stripAnsi(str) {
   return str
     .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
@@ -115,7 +168,8 @@ const api = {
   },
 
   async get(path) {
-    const res = await fetch(`${this.baseUrl}${path}?token=${state.token}`, { headers: this.headers() });
+    const sep = path.includes('?') ? '&' : '?';
+    const res = await fetch(`${this.baseUrl}${path}${sep}token=${state.token}`, { headers: this.headers() });
     if (!res.ok) throw new Error(await res.text());
     return res.json();
   },
@@ -144,9 +198,16 @@ const api = {
 
 // ── WebSocket ───────────────────────────────────────────────
 
+const wsSendQueue = [];
+
 function connectWS() {
-  if (!state.token) return; // No connection info yet
+  if (!state.token) { console.warn('[ws] no token, skipping connect'); return; }
   if (state.ws?.readyState === WebSocket.OPEN) return;
+  // If a previous socket is still CONNECTING or CLOSING, tear it down
+  if (state.ws) {
+    try { state.ws.onclose = null; state.ws.close(); } catch {}
+    state.ws = null;
+  }
 
   // Determine WebSocket host from serverUrl or current location
   let wsHost;
@@ -163,12 +224,26 @@ function connectWS() {
     wsHost = `${proto}://${location.host}`;
   }
 
-  const ws = new WebSocket(`${wsHost}?token=${state.token}`);
+  const wsUrl = `${wsHost}?token=${state.token}`;
+  console.log('[ws] connecting to', wsUrl);
+  const ws = new WebSocket(wsUrl);
   state.ws = ws;
 
   ws.onopen = () => {
+    console.log('[ws] connected');
     state.connected = true;
     updateConnectionUI();
+
+    // Flush any messages queued while the socket was connecting
+    while (wsSendQueue.length > 0) {
+      const queued = wsSendQueue.shift();
+      ws.send(JSON.stringify(queued));
+    }
+
+    // Re-subscribe to active session after reconnect (e.g. returning from background)
+    if (state.activeSessionId && state.currentView === 'session') {
+      wsSend({ type: 'subscribe', sessionId: state.activeSessionId });
+    }
   };
 
   ws.onmessage = (e) => {
@@ -176,18 +251,24 @@ function connectWS() {
     handleWSMessage(msg);
   };
 
-  ws.onclose = () => {
+  ws.onclose = (e) => {
+    console.warn('[ws] closed', e.code, e.reason);
     state.connected = false;
     updateConnectionUI();
     setTimeout(connectWS, 3000);
   };
 
-  ws.onerror = () => {};
+  ws.onerror = (e) => { console.error('[ws] error', e); };
 }
 
 function wsSend(msg) {
   if (state.ws?.readyState === WebSocket.OPEN) {
     state.ws.send(JSON.stringify(msg));
+  } else {
+    console.warn('[ws] queuing message, ws not open. readyState:', state.ws?.readyState, 'msg:', msg.type);
+    wsSendQueue.push(msg);
+    // Make sure we're trying to connect
+    connectWS();
   }
 }
 
@@ -200,6 +281,7 @@ function handleWSMessage(msg) {
       break;
 
     case 'output':
+      console.log('[ws] output for', msg.sessionId, 'active:', state.activeSessionId, 'match:', msg.sessionId === state.activeSessionId, 'len:', msg.data?.length);
       if (msg.sessionId === state.activeSessionId) {
         appendTerminalOutput(msg.data);
         accumulateForTTS(msg.data);
@@ -207,7 +289,7 @@ function handleWSMessage(msg) {
       break;
 
     case 'session:attention':
-      handleAttention(msg.sessionId, msg.preview);
+      handleAttention(msg.sessionId, msg.reason, msg.preview);
       break;
 
     case 'session:exit':
@@ -274,6 +356,38 @@ function showUpdateBanner(info) {
       }
     } catch (err) {
       btn.textContent = 'Failed';
+    }
+  };
+}
+
+function showApkUpdateBanner(data, clientVersion) {
+  const existing = document.querySelector('.apk-update-banner');
+  if (existing) existing.remove();
+
+  const size = data.apkSize ? ` (${(data.apkSize / 1024 / 1024).toFixed(1)} MB)` : '';
+  const downloadUrl = `${api.baseUrl}/api/app/download`;
+
+  const banner = document.createElement('div');
+  banner.className = 'apk-update-banner';
+  banner.innerHTML = `
+    <div style="flex:1;">
+      <strong>App update available</strong>
+      <span style="opacity:0.7;margin-left:6px;">${clientVersion} → ${data.version}</span>
+      <span style="opacity:0.5;margin-left:6px;">${size}</span>
+    </div>
+    <button class="update-btn" id="apk-download-btn">Download APK</button>
+    <button class="update-dismiss" id="apk-dismiss-btn">✕</button>
+  `;
+
+  document.body.prepend(banner);
+  document.getElementById('apk-dismiss-btn').onclick = () => banner.remove();
+  document.getElementById('apk-download-btn').onclick = () => {
+    // Post message to bootstrap parent to handle download (it has Capacitor bridge)
+    // Falls back to window.open which opens the system browser
+    if (window.parent !== window) {
+      window.parent.postMessage({ type: 'download-apk', url: downloadUrl }, '*');
+    } else {
+      window.open(downloadUrl, '_blank');
     }
   };
 }
@@ -346,32 +460,60 @@ function navigate(view, params = {}) {
           <div style="font-size:48px;opacity:0.3;margin-bottom:16px;">⌘</div>
           <h2 style="font-size:20px;font-weight:700;margin-bottom:6px;">Claude Remote</h2>
           <p class="dim" style="margin-bottom:28px;line-height:1.5;max-width:300px;">
-            Enter your server URL and auth token, or open the link printed by the server on your phone.
+            Enter your server URL and password to connect.
           </p>
           <div style="width:100%;max-width:340px;text-align:left;">
             <label class="field-label">Server URL</label>
             <input type="url" class="field-input" id="connect-url" placeholder="http://100.64.1.5:3033" value="${state.serverUrl || ''}">
-            <label class="field-label">Auth Token</label>
-            <input type="text" class="field-input" id="connect-token" placeholder="abc123…" value="${state.token || ''}">
+            <label class="field-label">Password</label>
+            <input type="password" class="field-input" id="connect-password" placeholder="Enter password">
             <button class="btn-primary" id="connect-go" style="width:100%;margin-top:20px;padding:12px;">Connect</button>
+            <details style="margin-top:16px;">
+              <summary class="dim" style="cursor:pointer;font-size:13px;">Advanced: connect with token</summary>
+              <div style="margin-top:8px;">
+                <label class="field-label">Auth Token</label>
+                <input type="text" class="field-input" id="connect-token" placeholder="abc123…" value="${state.token || ''}">
+              </div>
+            </details>
             <p class="dim" id="connect-error" style="margin-top:12px;color:var(--red);display:none;"></p>
           </div>
         </div>
       `;
       $('#connect-go').onclick = async () => {
         const url = $('#connect-url').value.trim().replace(/\/+$/, '');
-        const token = $('#connect-token').value.trim();
+        const password = $('#connect-password').value.trim();
+        const tokenInput = $('#connect-token').value.trim();
         const errEl = $('#connect-error');
-        if (!url || !token) {
-          errEl.textContent = 'Both fields are required';
+        if (!url) {
+          errEl.textContent = 'Server URL is required';
           errEl.style.display = 'block';
           return;
         }
-        // Test connection
+        if (!password && !tokenInput) {
+          errEl.textContent = 'Enter a password or token';
+          errEl.style.display = 'block';
+          return;
+        }
         errEl.textContent = 'Connecting…';
         errEl.style.display = 'block';
         errEl.style.color = 'var(--text-3)';
         try {
+          let token = tokenInput;
+          // If password provided, exchange it for a token
+          if (password && !token) {
+            const loginRes = await fetch(`${url}/api/auth/login`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ password }),
+            });
+            if (!loginRes.ok) {
+              const err = await loginRes.json().catch(() => ({}));
+              throw new Error(err.error || 'Login failed');
+            }
+            const loginData = await loginRes.json();
+            token = loginData.token;
+          }
+          // Verify the token works
           const res = await fetch(`${url}/api/info?token=${token}`, {
             headers: { 'Authorization': `Bearer ${token}` },
           });
@@ -383,7 +525,7 @@ function navigate(view, params = {}) {
           connectWS();
           navigate('dashboard');
         } catch (err) {
-          errEl.textContent = 'Connection failed — check URL and token';
+          errEl.textContent = err.message || 'Connection failed';
           errEl.style.color = 'var(--red)';
         }
       };
@@ -400,6 +542,7 @@ function initDashboard() {
   updateConnectionUI();
 
   $('#btn-new-session').onclick = showNewSessionDialog;
+  $('#btn-quick-chat').onclick = showQuickChatPrompt;
 
   // Request fresh list
   wsSend({ type: 'list' });
@@ -442,15 +585,32 @@ function renderDashboard() {
     $('.card-time', card).textContent = timeAgo(s.lastActivity);
 
     // Events
-    card.onclick = (e) => {
-      if (e.target.closest('.card-btn')) return;
-      navigate('session', { id: s.id, name: s.name });
-    };
+    if (s.status === 'dead') {
+      // Dead session — reconnect on tap
+      const openSession = async () => {
+        try {
+          await api.post(`/api/sessions/${s.id}/reconnect`);
+          navigate('session', { id: s.id, name: s.name });
+        } catch (err) {
+          console.error('Reconnect failed:', err);
+        }
+      };
+      card.onclick = (e) => {
+        if (e.target.closest('.card-btn')) return;
+        openSession();
+      };
+      $('.card-btn-open', card).onclick = openSession;
+    } else {
+      card.onclick = (e) => {
+        if (e.target.closest('.card-btn')) return;
+        navigate('session', { id: s.id, name: s.name });
+      };
+      $('.card-btn-open', card).onclick = () => navigate('session', { id: s.id, name: s.name });
+    }
 
-    $('.card-btn-open', card).onclick = () => navigate('session', { id: s.id, name: s.name });
     $('.card-btn-kill', card).onclick = (e) => {
       e.stopPropagation();
-      if (confirm(`Kill "${s.name}"?`)) {
+      if (confirm(`${s.status === 'dead' ? 'Remove' : 'Kill'} "${s.name}"?`)) {
         api.del(`/api/sessions/${s.id}`);
       }
     };
@@ -528,6 +688,23 @@ function showNewSessionDialog() {
   nameInput.focus();
 }
 
+// ── Quick Chat ────────────────────────────────────────────────
+
+async function showQuickChatPrompt() {
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const chatName = `chat-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`;
+
+  try {
+    const info = await api.get('/api/info');
+    const cwd = `${info.home}/ClaudeChats/${chatName}`;
+    const session = await api.post('/api/sessions', { name: chatName, cwd });
+    navigate('session', { id: session.id, name: session.name });
+  } catch (err) {
+    alert('Error: ' + err.message);
+  }
+}
+
 function createDirItem(name, type, fullPath, size) {
   const div = document.createElement('div');
   div.className = 'dir-item';
@@ -563,60 +740,66 @@ function formatSize(bytes) {
 
 function initSessionView(sessionId) {
   // Subscribe to session output
+  console.log('[session] subscribing to', sessionId);
   wsSend({ type: 'subscribe', sessionId });
 
   // Init xterm.js
   initTerminal();
 
-  // View toggle (raw vs clean)
-  const toggleBtns = $$('.toggle-btn');
-  toggleBtns.forEach(btn => {
-    btn.onclick = () => {
-      toggleBtns.forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      const view = btn.dataset.view;
-      $('#xterm-container').classList.toggle('hidden', view !== 'raw');
-      $('#clean-container').classList.toggle('hidden', view !== 'clean');
-      if (view === 'raw' && state.xterm) {
-        state.fitAddon.fit();
-      }
-    };
-  });
+  // Jump to bottom button — use touchstart/mousedown + preventDefault to avoid stealing focus
+  const jumpBtn = $('#jump-bottom-btn');
+  if (jumpBtn) {
+    jumpBtn.onmousedown = jumpToBottom;
+    jumpBtn.ontouchstart = jumpToBottom;
+  }
 
-  // Quick actions
+  // Quick actions — send directly to pty
   $$('.qbtn').forEach(btn => {
     btn.onclick = () => {
-      const cmd = btn.dataset.cmd;
-      if (cmd) {
-        wsSend({ type: 'input', sessionId, data: cmd });
-        dismissAttention();
+      const raw = btn.dataset.cmd;
+      if (!raw) return;
+      // If data ends with \r (Enter), split text from Enter with a delay
+      if (raw.length > 1 && raw.endsWith('\r')) {
+        const text = raw.slice(0, -1);
+        wsSend({ type: 'input', sessionId, data: text });
+        setTimeout(() => {
+          wsSend({ type: 'input', sessionId, data: '\r' });
+        }, 150);
+      } else {
+        wsSend({ type: 'input', sessionId, data: raw });
       }
+      dismissAttention();
     };
   });
 
-  // Text input
+  // Text input — type command, Enter or Send sends it
   const cmdInput = $('#cmd-input');
   const sendBtn = $('#send-btn');
 
-  sendBtn.onclick = () => {
+  function sendCommand() {
     const val = cmdInput.value;
-    if (!val) return;
-    wsSend({ type: 'input', sessionId, data: val + '\n' });
+    if (!val && !val.trim()) {
+      // Empty input — just send Enter
+      wsSend({ type: 'input', sessionId, data: '\r' });
+    } else {
+      // Send text first, then Enter after a short delay
+      // Claude Code's TUI input needs this separation
+      wsSend({ type: 'input', sessionId, data: val });
+      setTimeout(() => {
+        wsSend({ type: 'input', sessionId, data: '\r' });
+      }, 150);
+    }
     cmdInput.value = '';
-    cmdInput.style.height = 'auto';
     dismissAttention();
-  };
+  }
+
+  sendBtn.onclick = sendCommand;
 
   cmdInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter') {
       e.preventDefault();
-      sendBtn.click();
+      sendCommand();
     }
-  });
-
-  cmdInput.addEventListener('input', () => {
-    cmdInput.style.height = 'auto';
-    cmdInput.style.height = Math.min(cmdInput.scrollHeight, 120) + 'px';
   });
 
   // Mic button
@@ -633,6 +816,7 @@ function initSessionView(sessionId) {
 
 function initTerminal() {
   const container = $('#xterm-container');
+  console.log('[term] init, container:', !!container, 'Terminal:', !!window.Terminal, 'FitAddon:', !!window.FitAddon);
   if (!container || !window.Terminal) return;
 
   const term = new window.Terminal({
@@ -688,9 +872,19 @@ function initTerminal() {
     wsSend({ type: 'input', sessionId: state.activeSessionId, data });
   });
 
-  // Resize on orientation change
+  // Resize on orientation change — skip when keyboard opens/closes to avoid scroll jumps
+  let resizeTimer = null;
   const resizeObserver = new ResizeObserver(() => {
-    if (state.xterm) {
+    if (!state.xterm) return;
+    // Skip resize when keyboard opens/closes — the terminal content size hasn't changed
+    if (keyboardOpen || keyboardTransitioning) return;
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      if (!state.xterm || keyboardOpen || keyboardTransitioning) return;
+      const vp = container.querySelector('.xterm-viewport');
+      const prevScroll = vp ? vp.scrollTop : 0;
+      const atBottom = !vp || (vp.scrollHeight - vp.scrollTop - vp.clientHeight < 80);
+
       fitAddon.fit();
       wsSend({
         type: 'resize',
@@ -698,13 +892,95 @@ function initTerminal() {
         cols: term.cols,
         rows: term.rows,
       });
-    }
+
+      // fit() resets scroll — restore position
+      if (vp) {
+        const target = atBottom ? vp.scrollHeight : prevScroll;
+        vp.scrollTop = target;
+        requestAnimationFrame(() => { vp.scrollTop = target; });
+      }
+    }, 150);
   });
   resizeObserver.observe(container);
 
+  // Tap terminal to focus input — but only on quick tap, not long-press (text selection)
+  let _tapStart = 0;
+  let _tapX = 0;
+  let _tapY = 0;
+  container.addEventListener('touchstart', (e) => {
+    _tapStart = Date.now();
+    _tapX = e.touches[0].clientX;
+    _tapY = e.touches[0].clientY;
+  }, { passive: true });
+  container.addEventListener('touchend', (e) => {
+    const dt = Date.now() - _tapStart;
+    const dx = e.changedTouches[0].clientX - _tapX;
+    const dy = e.changedTouches[0].clientY - _tapY;
+    // Quick tap (< 300ms) with minimal movement (< 10px) = focus input
+    // Long press or drag = let the browser handle text selection
+    if (dt < 300 && Math.abs(dx) < 10 && Math.abs(dy) < 10) {
+      if (!window.getSelection()?.toString()) {
+        const input = $('#cmd-input');
+        if (input) input.focus();
+      }
+    }
+  }, { passive: true });
+
+  // Momentum scrolling for xterm on mobile
+  // xterm handles scroll via JS (not native overflow), so we add inertia
+  const viewport = container.querySelector('.xterm-viewport');
+  if (viewport) {
+    enableMomentumScroll(container, {
+      getScrollPos: () => viewport.scrollTop,
+      setScrollPos: (v) => { viewport.scrollTop = v; },
+    });
+    viewport.addEventListener('scroll', updateJumpToBottomBtn, { passive: true });
+    // Enable text selection on long-press while keeping momentum scroll working.
+    // pointer-events:none prevents xterm from fighting our scroll, but also blocks
+    // text selection. We toggle it on long-press.
+    const screen = container.querySelector('.xterm-screen');
+    if (screen) {
+      screen.style.pointerEvents = 'none';
+      let _longPressTimer = null;
+      container.addEventListener('touchstart', (e) => {
+        _longPressTimer = setTimeout(() => {
+          // Long press detected — enable pointer events for text selection
+          screen.style.pointerEvents = 'auto';
+          screen.style.userSelect = 'text';
+          screen.style.webkitUserSelect = 'text';
+        }, 400);
+      }, { passive: true });
+      container.addEventListener('touchmove', () => {
+        // Moved — it's a scroll, not a long press
+        clearTimeout(_longPressTimer);
+      }, { passive: true });
+      container.addEventListener('touchend', () => {
+        clearTimeout(_longPressTimer);
+        // Re-disable after a delay so copy menu can be used
+        setTimeout(() => {
+          if (!window.getSelection()?.toString()) {
+            screen.style.pointerEvents = 'none';
+            screen.style.userSelect = '';
+            screen.style.webkitUserSelect = '';
+          }
+        }, 300);
+      }, { passive: true });
+      // Once user clears selection (taps away), restore pointer-events:none
+      document.addEventListener('selectionchange', () => {
+        if (!window.getSelection()?.toString() && screen.style.pointerEvents === 'auto') {
+          screen.style.pointerEvents = 'none';
+          screen.style.userSelect = '';
+          screen.style.webkitUserSelect = '';
+        }
+      });
+    }
+  }
+
   state.xterm = term;
   state.fitAddon = fitAddon;
-  state.cleanBuffer = '';
+
+  // Install scroll lock after xterm viewport is in the DOM
+  setTimeout(installScrollLock, 200);
 }
 
 function destroyTerminal() {
@@ -713,101 +989,228 @@ function destroyTerminal() {
     state.xterm = null;
     state.fitAddon = null;
   }
-  state.cleanBuffer = '';
 }
 
+// Scroll lock: when the user is scrolled up, prevent xterm.write() from
+// auto-scrolling to the bottom. We do this by intercepting the scroll event
+// on the viewport during writes and snapping back immediately.
+let _scrollLocked = false;
+let _lockScrollPos = 0;
+
 function appendTerminalOutput(data) {
-  // Raw view — write to xterm
-  if (state.xterm) {
+  if (!state.xterm) return;
+
+  const vp = document.querySelector('#xterm-container .xterm-viewport');
+  const atBottom = !vp || (vp.scrollHeight - vp.scrollTop - vp.clientHeight < 80);
+
+  if (!atBottom && vp) {
+    // User is scrolled up — lock scroll position during the write
+    _scrollLocked = true;
+    _lockScrollPos = vp.scrollTop;
+
+    state.xterm.write(data, () => {
+      vp.scrollTop = _lockScrollPos;
+      // Keep lock active briefly to catch any deferred reflows
+      requestAnimationFrame(() => {
+        vp.scrollTop = _lockScrollPos;
+        _scrollLocked = false;
+      });
+    });
+  } else {
     state.xterm.write(data);
   }
 
-  // Clean view — accumulate and render
-  state.cleanBuffer += data;
-  if (state.cleanBuffer.length > 100_000) {
-    state.cleanBuffer = state.cleanBuffer.slice(-60_000);
-  }
-  renderCleanView();
+  updateJumpToBottomBtn();
 }
 
-function renderCleanView() {
-  const container = $('#clean-container');
-  if (!container) return;
-
-  const clean = stripAnsi(state.cleanBuffer);
-  const lines = clean.split('\n');
-
-  // Simple heuristic: group lines into blocks
-  // Lines that look like Claude output vs shell commands
-  let html = '';
-  let currentBlock = '';
-  let blockType = 'system';
-
-  for (const line of lines.slice(-200)) {  // Last 200 lines
-    const trimmed = line.trim();
-    if (!trimmed) {
-      if (currentBlock) {
-        html += `<div class="clean-block ${blockType}">${escapeHtml(currentBlock.trim())}</div>`;
-        currentBlock = '';
-        blockType = 'system';
-      }
-      continue;
+// Intercept scroll events on the xterm viewport to enforce the lock.
+// This catches xterm's synchronous scroll-to-bottom during write().
+function installScrollLock() {
+  const vp = document.querySelector('#xterm-container .xterm-viewport');
+  if (!vp || vp._scrollLockInstalled) return;
+  vp._scrollLockInstalled = true;
+  vp.addEventListener('scroll', () => {
+    if (_scrollLocked) {
+      vp.scrollTop = _lockScrollPos;
     }
-
-    // Detect Claude-like output (longer prose, not commands)
-    if (trimmed.length > 60 && !trimmed.startsWith('$') && !trimmed.startsWith('/') && !trimmed.match(/^[a-z_]+\(/)) {
-      blockType = 'claude';
-    }
-
-    currentBlock += line + '\n';
-  }
-
-  if (currentBlock.trim()) {
-    html += `<div class="clean-block ${blockType}">${escapeHtml(currentBlock.trim())}</div>`;
-  }
-
-  container.innerHTML = html;
-  container.scrollTop = container.scrollHeight;
+  }, { passive: false });
 }
 
 function escapeHtml(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+// ── Jump to Bottom ────────────────────────────────────────
+
+function updateJumpToBottomBtn() {
+  const btn = $('#jump-bottom-btn');
+  if (!btn) return;
+
+  const viewport = document.querySelector('#xterm-container .xterm-viewport');
+  if (!viewport) { btn.classList.add('hidden'); return; }
+
+  const nearBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 120;
+  btn.classList.toggle('hidden', nearBottom);
+}
+
+function jumpToBottom(e) {
+  // Prevent the button from stealing focus (which closes the keyboard)
+  if (e) e.preventDefault();
+
+  const viewport = document.querySelector('#xterm-container .xterm-viewport');
+  if (viewport) viewport.scrollTop = viewport.scrollHeight;
+  if (state.xterm) state.xterm.scrollToBottom();
+
+  const btn = $('#jump-bottom-btn');
+  if (btn) btn.classList.add('hidden');
+}
+
 // ── Attention Handling ──────────────────────────────────────
 
-function handleAttention(sessionId, preview) {
-  // Update session card on dashboard
-  const session = state.sessions.find(s => s.id === sessionId);
+// Audio chime using Web Audio API (works in Android WebViews)
+let _audioCtx = null;
+function playChime(type) {
+  try {
+    if (!_audioCtx) _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const ctx = _audioCtx;
+    const now = ctx.currentTime;
 
-  // If we're viewing this session, show the banner
-  if (sessionId === state.activeSessionId && state.currentView === 'session') {
-    const bar = $('#attention-bar');
-    const msg = $('#attention-msg');
-    if (bar) {
-      bar.classList.remove('hidden');
-      if (msg) msg.textContent = preview || '';
+    if (type === 'prompt') {
+      // Two-tone urgent chime
+      [520, 680].forEach((freq, i) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0.3, now + i * 0.15);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + i * 0.15 + 0.3);
+        osc.connect(gain).connect(ctx.destination);
+        osc.start(now + i * 0.15);
+        osc.stop(now + i * 0.15 + 0.3);
+      });
+    } else {
+      // Single soft tone for idle
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = 440;
+      gain.gain.setValueAtTime(0.2, now);
+      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.4);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.4);
+    }
+  } catch {}
+}
+
+function handleAttention(sessionId, reason, preview) {
+  const session = state.sessions.find(s => s.id === sessionId);
+  const name = session?.name || 'Session';
+
+  // Skip if user is actively viewing this session
+  if (state.currentView === 'session' && state.activeSessionId === sessionId && !document.hidden) return;
+
+  if (!state.alertsEnabled) return;
+
+  if (reason === 'prompt') {
+    // Claude is blocked waiting for user input
+    if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+    playChime('prompt');
+
+    // Try Web Notification (works in some contexts)
+    try {
+      if (Notification.permission === 'granted') {
+        new Notification(`${name} needs input`, {
+          body: preview ? preview.slice(0, 120) : 'Claude is waiting for your response',
+          tag: `claude-prompt-${sessionId}`,
+          renotify: true,
+        });
+      }
+    } catch {}
+
+    if (state.ttsEnabled) {
+      speak(preview || 'Claude needs input.');
+    }
+  } else if (reason === 'idle') {
+    // Output finished
+    if (navigator.vibrate) navigator.vibrate([100]);
+    playChime('idle');
+
+    try {
+      if (Notification.permission === 'granted') {
+        new Notification(`${name} — output finished`, {
+          body: 'Claude appears to be done.',
+          tag: `claude-idle-${sessionId}`,
+          renotify: true,
+        });
+      }
+    } catch {}
+
+    if (state.ttsEnabled) {
+      speak(`${name} output finished.`);
     }
   }
 
-  // Vibrate
-  if (state.alertsEnabled && navigator.vibrate) {
-    navigator.vibrate([200, 100, 200]);
-  }
+  // Show in-app toast regardless of view
+  showAttentionToast(sessionId, name, reason, preview);
+}
 
-  // Push notification if backgrounded
-  if (document.hidden && Notification.permission === 'granted') {
-    const name = session?.name || 'Session';
-    new Notification(`${name} needs input`, {
-      body: preview ? preview.slice(0, 120) : 'Claude is waiting for your response',
-      tag: `claude-${sessionId}`,
-      renotify: true,
-    });
-  }
+// In-app toast notification (works regardless of Android WebView limitations)
+function showAttentionToast(sessionId, name, reason, preview) {
+  // Remove existing toast for this session
+  const existing = document.querySelector(`.attention-toast[data-session="${sessionId}"]`);
+  if (existing) existing.remove();
 
-  // TTS
-  if (state.ttsEnabled && state.alertsEnabled) {
-    speak('Attention. ' + (preview || 'Claude needs input.'));
+  const toast = document.createElement('div');
+  toast.className = 'attention-toast';
+  toast.dataset.session = sessionId;
+
+  const icon = reason === 'prompt' ? '⚡' : '✓';
+  const title = reason === 'prompt' ? `${name} needs input` : `${name} — done`;
+  const body = reason === 'prompt'
+    ? (preview ? preview.slice(0, 100) : 'Claude is waiting for your response')
+    : 'Output finished';
+
+  toast.innerHTML = `
+    <div class="toast-icon">${icon}</div>
+    <div class="toast-body">
+      <div class="toast-title">${title}</div>
+      <div class="toast-msg">${body}</div>
+    </div>
+    <button class="toast-close">✕</button>
+  `;
+
+  // Tap toast to navigate to session
+  toast.addEventListener('click', (e) => {
+    if (e.target.closest('.toast-close')) {
+      toast.remove();
+      return;
+    }
+    toast.remove();
+    navigate('session', { id: sessionId, name });
+  });
+
+  // Auto-dismiss after 8 seconds
+  setTimeout(() => toast.remove(), 8000);
+
+  document.body.appendChild(toast);
+  // Trigger animation
+  requestAnimationFrame(() => toast.classList.add('show'));
+}
+
+// Check for attention events we missed while backgrounded
+// Called when app returns to foreground after reconnect
+function checkMissedAttention() {
+  if (!state.sessions?.length) return;
+  for (const s of state.sessions) {
+    if (s.attentionReason && s.attentionAt) {
+      // Only fire if the attention happened while we were away (last 5 minutes)
+      const age = Date.now() - s.attentionAt;
+      if (age < 300_000) {
+        const name = s.name || 'Session';
+        handleAttention(s.id, s.attentionReason, s.attentionPreview);
+      }
+    }
   }
 }
 
@@ -950,16 +1353,24 @@ function initSettings() {
     };
   });
 
-  // Notification permission
+  // Notification permission — handled by bootstrap's Capacitor Local Notifications
+  // The bootstrap page (parent) manages native notifications via polling.
+  // This button requests Web Notification permission as a fallback.
   const notifBtn = $('#btn-notif-perm');
   if (notifBtn) {
-    if (Notification.permission === 'granted') {
+    // Check if running inside bootstrap iframe (Capacitor handles notifications)
+    if (window.parent !== window) {
+      notifBtn.textContent = 'Managed by App';
+      notifBtn.disabled = true;
+    } else if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
       notifBtn.textContent = 'Enabled ✓';
     }
     notifBtn.onclick = () => {
-      Notification.requestPermission().then(p => {
-        notifBtn.textContent = p === 'granted' ? 'Enabled ✓' : 'Denied';
-      });
+      if (typeof Notification !== 'undefined') {
+        Notification.requestPermission().then(p => {
+          notifBtn.textContent = p === 'granted' ? 'Enabled ✓' : 'Denied';
+        });
+      }
     };
   }
 
@@ -1147,12 +1558,79 @@ function migrateClientSettings() {
 
 migrateClientSettings();
 
+// ── Keyboard detection ──────────────────────────────────────
+// Track whether the software keyboard is open so the ResizeObserver can skip
+// fitAddon.fit() during keyboard transitions (which cause scroll jumps).
+// Also shrink the app to the visible viewport so the keyboard doesn't cover the input bar.
+let keyboardOpen = false;
+let keyboardTransitioning = false;
+(function setupKeyboardDetection() {
+  const vv = window.visualViewport;
+  if (!vv) return;
+  let fullHeight = vv.height;
+  let transitionTimer = null;
+
+  function updateAppHeight() {
+    document.documentElement.style.setProperty('--app-height', vv.height + 'px');
+  }
+
+  vv.addEventListener('resize', () => {
+    const heightDiff = fullHeight - vv.height;
+    const wasOpen = keyboardOpen;
+    keyboardOpen = heightDiff > 100;
+
+    // Always update app height to match visible viewport
+    updateAppHeight();
+
+    if (!keyboardOpen && wasOpen) {
+      // Keyboard just closed — suppress ResizeObserver fit() during the close animation
+      keyboardTransitioning = true;
+      clearTimeout(transitionTimer);
+      transitionTimer = setTimeout(() => {
+        keyboardTransitioning = false;
+        fullHeight = vv.height;
+        updateAppHeight();
+        // Now do a single fit after the animation settles
+        if (state.xterm && state.fitAddon) {
+          const container = document.querySelector('#xterm-container');
+          const viewport = container?.querySelector('.xterm-viewport');
+          const prevScroll = viewport ? viewport.scrollTop : 0;
+          const atBottom = !viewport || (viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 80);
+
+          state.fitAddon.fit();
+          wsSend({
+            type: 'resize',
+            sessionId: state.activeSessionId,
+            cols: state.xterm.cols,
+            rows: state.xterm.rows,
+          });
+
+          if (viewport) {
+            const target = atBottom ? viewport.scrollHeight : prevScroll;
+            viewport.scrollTop = target;
+          }
+        }
+      }, 400);
+    }
+
+    if (!keyboardOpen) {
+      fullHeight = vv.height;
+    }
+  });
+
+  // Also listen to scroll events — Android may pan the viewport instead of resizing
+  vv.addEventListener('scroll', updateAppHeight);
+})();
+
 // Startup
 if (state.token) {
   connectWS();
   navigate('dashboard');
 
-  // Check for updates 10s after startup
+  // APK version check is handled by the bootstrap page before loading the app.
+  // No need to re-check here.
+
+  // Check for server code updates 10s after startup
   setTimeout(async () => {
     try {
       const res = await fetch(`${api.baseUrl}/api/update/check?token=${state.token}`, {
@@ -1171,3 +1649,25 @@ if (state.token) {
 
 // Keep-alive
 setInterval(() => wsSend({ type: 'ping' }), 25000);
+
+// Reconnect immediately when app returns from background
+// and check for missed attention events
+let _wasHidden = false;
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    _wasHidden = true;
+    return;
+  }
+  // App just came back to foreground
+  if (state.token) {
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+      connectWS();
+    }
+    // Check for missed attention after a short delay (let WS reconnect and send session list)
+    if (_wasHidden) {
+      _wasHidden = false;
+      setTimeout(checkMissedAttention, 1500);
+    }
+  }
+});
+

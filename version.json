@@ -1,8 +1,18 @@
 {
-  "version": "0.1.0",
-  "settingsVersion": 1,
+  "version": "0.2.0",
+  "settingsVersion": 2,
   "minClientVersion": "0.1.0",
   "changelog": [
+    {
+      "version": "0.2.0",
+      "date": "2026-04-01",
+      "changes": [
+        "Native Android push notifications via Capacitor Local Notifications",
+        "Background attention polling (notifications work when app is backgrounded)",
+        "In-app toast notifications with audio chime",
+        "Removed document.hidden gate — alerts fire from any view"
+      ]
+    },
     {
       "version": "0.1.0",
       "date": "2026-03-31",

@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Claude Remote — Admin</title>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Outfit:wght@400;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-0: #0b0c10; --bg-1: #12131a; --bg-2: #1a1c26; --bg-3: #222433; --bg-4: #2a2d40;
+      --border-0: #1e2030; --border-1: #2d3048; --border-2: #3d415c;
+      --text-0: #e4e6f0; --text-1: #b0b4c8; --text-2: #7a7f9a; --text-3: #4e526a;
+      --green: #4ae08c; --green-bg: rgba(74,224,140,0.08); --green-border: rgba(74,224,140,0.2);
+      --amber: #f0c050; --red: #f06070; --red-bg: rgba(240,96,112,0.08);
+      --blue: #60a0f0; --accent: #a080f0; --accent-bg: rgba(160,128,240,0.08); --accent-border: rgba(160,128,240,0.25);
+      --font-ui: 'Outfit', system-ui, sans-serif;
+      --font-mono: 'IBM Plex Mono', 'Menlo', monospace;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; background: var(--bg-0); color: var(--text-0); font-family: var(--font-ui); font-size: 15px; -webkit-font-smoothing: antialiased; }
+    body { overflow-y: auto; padding: 24px; }
+
+    .container { max-width: 720px; margin: 0 auto; }
+
+    .header { display: flex; align-items: center; gap: 12px; margin-bottom: 32px; padding-bottom: 16px; border-bottom: 1px solid var(--border-1); }
+    .header h1 { font-size: 22px; font-weight: 700; }
+    .header .badge { font-size: 12px; font-family: var(--font-mono); background: var(--green-bg); color: var(--green); border: 1px solid var(--green-border); padding: 2px 10px; border-radius: 12px; }
+    .header .badge.offline { background: var(--red-bg); color: var(--red); border-color: var(--red); }
+
+    .card { background: var(--bg-1); border: 1px solid var(--border-0); border-radius: 10px; padding: 20px; margin-bottom: 16px; }
+    .card h2 { font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-2); margin-bottom: 14px; }
+
+    .stat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
+    .stat { background: var(--bg-2); border-radius: 8px; padding: 12px; }
+    .stat-label { font-size: 12px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px; }
+    .stat-value { font-family: var(--font-mono); font-size: 14px; color: var(--text-0); word-break: break-all; }
+
+    .token-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+    .token-display { flex: 1; font-family: var(--font-mono); font-size: 13px; background: var(--bg-2); border: 1px solid var(--border-1); border-radius: 6px; padding: 10px 12px; color: var(--text-1); user-select: all; overflow-x: auto; white-space: nowrap; }
+
+    .btn { font-family: var(--font-ui); font-size: 13px; font-weight: 600; border: none; border-radius: 6px; padding: 8px 16px; cursor: pointer; transition: opacity 0.15s; }
+    .btn:hover { opacity: 0.85; }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-secondary { background: var(--bg-3); color: var(--text-1); border: 1px solid var(--border-1); }
+    .btn-danger { background: var(--red); color: #fff; }
+    .btn-sm { padding: 6px 12px; font-size: 12px; }
+
+    .field-label { display: block; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-2); margin-bottom: 6px; margin-top: 12px; }
+    .field-input { width: 100%; font-family: var(--font-mono); font-size: 14px; background: var(--bg-2); border: 1px solid var(--border-1); border-radius: 6px; padding: 10px 12px; color: var(--text-0); outline: none; }
+    .field-input:focus { border-color: var(--accent); }
+
+    .password-form { display: flex; gap: 8px; align-items: flex-end; margin-top: 4px; }
+    .password-form .field-input { flex: 1; }
+
+    .msg { font-size: 13px; margin-top: 8px; }
+    .msg.ok { color: var(--green); }
+    .msg.err { color: var(--red); }
+
+    .client-list { margin-top: 8px; }
+    .client-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; background: var(--bg-2); border-radius: 6px; margin-bottom: 6px; font-family: var(--font-mono); font-size: 13px; }
+    .client-row .ip { color: var(--text-0); }
+    .client-row .meta { color: var(--text-3); font-size: 12px; }
+
+    .session-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; background: var(--bg-2); border-radius: 6px; margin-bottom: 6px; }
+    .session-name { font-weight: 600; font-size: 14px; }
+    .session-status { font-family: var(--font-mono); font-size: 12px; padding: 2px 8px; border-radius: 10px; }
+    .session-status.working { background: var(--green-bg); color: var(--green); }
+    .session-status.idle { background: var(--bg-3); color: var(--text-2); }
+    .session-status.waiting { background: rgba(240,192,80,0.1); color: var(--amber); }
+
+    .controls { display: flex; gap: 8px; flex-wrap: wrap; }
+
+    .empty { color: var(--text-3); font-size: 13px; font-style: italic; padding: 8px 0; }
+
+    /* Auth screen */
+    .auth-screen { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 60vh; text-align: center; }
+    .auth-screen h2 { font-size: 20px; margin-bottom: 8px; }
+    .auth-screen p { color: var(--text-2); margin-bottom: 24px; }
+    .auth-screen .form { width: 100%; max-width: 340px; text-align: left; }
+  </style>
+</head>
+<body>
+  <div class="container" id="app"></div>
+
+  <script>
+    const app = document.getElementById('app');
+    let token = new URLSearchParams(location.search).get('token') || localStorage.getItem('admin-token') || '';
+    let refreshTimer = null;
+
+    function timeAgo(ts) {
+      const diff = Date.now() - ts;
+      if (diff < 60000) return 'just now';
+      if (diff < 3600000) return Math.floor(diff / 60000) + 'm ago';
+      if (diff < 86400000) return Math.floor(diff / 3600000) + 'h ago';
+      return Math.floor(diff / 86400000) + 'd ago';
+    }
+
+    function formatUptime(s) {
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      if (h > 0) return `${h}h ${m}m`;
+      return `${m}m ${Math.floor(s % 60)}s`;
+    }
+
+    async function api(path, opts = {}) {
+      const res = await fetch(`/api${path}?token=${token}`, {
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', ...opts.headers },
+        ...opts,
+      });
+      return res;
+    }
+
+    // ── Auth screen ──
+    function showAuth(error) {
+      clearInterval(refreshTimer);
+      app.innerHTML = `
+        <div class="auth-screen">
+          <div style="font-size:48px;opacity:0.3;margin-bottom:16px;">&#x2318;</div>
+          <h2>Claude Remote Admin</h2>
+          <p>Enter your password or token to access the admin panel.</p>
+          <div class="form">
+            <label class="field-label">Password</label>
+            <input type="password" class="field-input" id="auth-password" placeholder="Enter password">
+            <details style="margin-top:12px;">
+              <summary style="cursor:pointer;font-size:13px;color:var(--text-2);">Use token instead</summary>
+              <label class="field-label">Token</label>
+              <input type="text" class="field-input" id="auth-token" placeholder="abc123...">
+            </details>
+            <button class="btn btn-primary" style="width:100%;margin-top:16px;padding:12px;" id="auth-go">Sign In</button>
+            ${error ? `<p class="msg err" style="margin-top:8px;">${error}</p>` : ''}
+          </div>
+        </div>
+      `;
+      document.getElementById('auth-go').onclick = async () => {
+        const pw = document.getElementById('auth-password').value.trim();
+        const tk = document.getElementById('auth-token')?.value?.trim();
+        if (tk) {
+          token = tk;
+          localStorage.setItem('admin-token', token);
+          loadAdmin();
+        } else if (pw) {
+          try {
+            const res = await fetch('/api/auth/login', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ password: pw }),
+            });
+            if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || 'Login failed'); }
+            const data = await res.json();
+            token = data.token;
+            localStorage.setItem('admin-token', token);
+            loadAdmin();
+          } catch (e) {
+            showAuth(e.message);
+          }
+        }
+      };
+      document.getElementById('auth-password').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') document.getElementById('auth-go').click();
+      });
+    }
+
+    // ── Admin panel ──
+    async function loadAdmin() {
+      try {
+        const res = await api('/admin/status');
+        if (!res.ok) { showAuth('Session expired'); return; }
+        const data = await res.json();
+        renderAdmin(data);
+        clearInterval(refreshTimer);
+        refreshTimer = setInterval(() => refreshStatus(), 5000);
+      } catch {
+        showAuth('Cannot reach server');
+      }
+    }
+
+    async function refreshStatus() {
+      // Don't refresh while user is typing
+      if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
+      try {
+        const res = await api('/admin/status');
+        if (!res.ok) return;
+        const d = await res.json();
+        // Update only dynamic parts — don't touch form inputs
+        const el = (id) => document.getElementById(id);
+        if (el('stat-uptime')) el('stat-uptime').textContent = formatUptime(d.uptime);
+        if (el('stat-clients')) el('stat-clients').textContent = d.clients?.length || 0;
+        if (el('client-list')) {
+          el('client-list').innerHTML = (d.clients && d.clients.length) ? d.clients.map(c => `
+            <div class="client-row">
+              <span class="ip">${c.ip}</span>
+              <span class="meta">connected ${timeAgo(c.connectedAt)}${c.subscribedSession ? ' &middot; watching session' : ''}</span>
+            </div>
+          `).join('') : '<div class="empty">No clients connected</div>';
+          el('client-count').textContent = d.clients?.length || 0;
+        }
+        if (el('session-list')) {
+          el('session-list').innerHTML = (d.sessions && d.sessions.length) ? d.sessions.map(s => `
+            <div class="session-row">
+              <div>
+                <div class="session-name">${s.name || 'Unnamed'}</div>
+                <div style="font-size:12px;color:var(--text-3);font-family:var(--font-mono);">${s.cwd || ''}</div>
+              </div>
+              <span class="session-status ${s.status || 'idle'}">${s.status || 'idle'}</span>
+            </div>
+          `).join('') : '<div class="empty">No active sessions</div>';
+          el('session-count').textContent = d.sessions?.length || 0;
+        }
+        if (el('pw-status')) {
+          el('pw-status').innerHTML = d.passwordSet ? '<span style="color:var(--green);">(set)</span>' : '<span style="color:var(--text-3);">(not set)</span>';
+        }
+      } catch {}
+    }
+
+    function renderAdmin(d) {
+      const ver = d.version?.version || '?';
+      app.innerHTML = `
+        <div class="header">
+          <h1>&#x2318; Claude Remote</h1>
+          <span class="badge">v${ver} &middot; online</span>
+        </div>
+
+        <!-- Status -->
+        <div class="card">
+          <h2>Server Status</h2>
+          <div class="stat-grid">
+            <div class="stat"><div class="stat-label">Hostname</div><div class="stat-value">${d.hostname}</div></div>
+            <div class="stat"><div class="stat-label">Uptime</div><div class="stat-value" id="stat-uptime">${formatUptime(d.uptime)}</div></div>
+            <div class="stat"><div class="stat-label">Port</div><div class="stat-value">${d.port}</div></div>
+            <div class="stat"><div class="stat-label">LAN IP</div><div class="stat-value">${d.ips?.lanIp || 'unknown'}</div></div>
+            <div class="stat"><div class="stat-label">Tailscale IP</div><div class="stat-value">${d.ips?.tailscaleIp || 'not detected'}</div></div>
+            <div class="stat"><div class="stat-label">Clients</div><div class="stat-value" id="stat-clients">${d.clients?.length || 0}</div></div>
+          </div>
+        </div>
+
+        <!-- Auth -->
+        <div class="card">
+          <h2>Authentication</h2>
+          <label class="field-label" style="margin-top:0;">Auth Token</label>
+          <div class="token-row">
+            <div class="token-display" id="token-display">${token}</div>
+            <button class="btn btn-secondary btn-sm" id="copy-token">Copy</button>
+          </div>
+          <label class="field-label">Password <span id="pw-status">${d.passwordSet ? '<span style="color:var(--green);">(set)</span>' : '<span style="color:var(--text-3);">(not set)</span>'}</span></label>
+          <div class="password-form">
+            <input type="password" class="field-input" id="new-password" placeholder="${d.passwordSet ? 'Change password...' : 'Set a password...'}">
+            <button class="btn btn-primary btn-sm" id="set-password">Set</button>
+            ${d.passwordSet ? '<button class="btn btn-danger btn-sm" id="remove-password">Remove</button>' : ''}
+          </div>
+          <p class="msg" id="pw-msg"></p>
+        </div>
+
+        <!-- Connected Clients -->
+        <div class="card">
+          <h2>Connected Clients (<span id="client-count">${d.clients?.length || 0}</span>)</h2>
+          <div class="client-list" id="client-list">
+            ${(d.clients && d.clients.length) ? d.clients.map(c => `
+              <div class="client-row">
+                <span class="ip">${c.ip}</span>
+                <span class="meta">connected ${timeAgo(c.connectedAt)}${c.subscribedSession ? ' &middot; watching session' : ''}</span>
+              </div>
+            `).join('') : '<div class="empty">No clients connected</div>'}
+          </div>
+        </div>
+
+        <!-- Sessions -->
+        <div class="card">
+          <h2>Sessions (<span id="session-count">${d.sessions?.length || 0}</span>)</h2>
+          <div id="session-list">${(d.sessions && d.sessions.length) ? d.sessions.map(s => `
+            <div class="session-row">
+              <div>
+                <div class="session-name">${s.name || 'Unnamed'}</div>
+                <div style="font-size:12px;color:var(--text-3);font-family:var(--font-mono);">${s.cwd || ''}</div>
+              </div>
+              <span class="session-status ${s.status || 'idle'}">${s.status || 'idle'}</span>
+            </div>
+          `).join('') : '<div class="empty">No active sessions</div>'}</div>
+        </div>
+
+        <!-- Controls -->
+        <div class="card">
+          <h2>Controls</h2>
+          <div class="controls">
+            <button class="btn btn-secondary" id="btn-restart">Restart Server</button>
+            <button class="btn btn-secondary" id="btn-check-update">Check for Updates</button>
+          </div>
+          <p class="msg" id="ctrl-msg"></p>
+        </div>
+      `;
+
+      // Wire up buttons
+      document.getElementById('copy-token').onclick = () => {
+        navigator.clipboard.writeText(token).then(() => {
+          document.getElementById('copy-token').textContent = 'Copied!';
+          setTimeout(() => document.getElementById('copy-token').textContent = 'Copy', 1500);
+        });
+      };
+
+      document.getElementById('set-password').onclick = async () => {
+        const pw = document.getElementById('new-password').value;
+        const msg = document.getElementById('pw-msg');
+        if (!pw) { msg.className = 'msg err'; msg.textContent = 'Enter a password'; return; }
+        try {
+          const res = await api('/admin/password', { method: 'POST', body: JSON.stringify({ password: pw }) });
+          if (!res.ok) throw new Error((await res.json()).error);
+          msg.className = 'msg ok'; msg.textContent = 'Password set successfully';
+          document.getElementById('new-password').value = '';
+          setTimeout(() => refreshStatus(), 500);
+        } catch (e) { msg.className = 'msg err'; msg.textContent = e.message; }
+      };
+
+      const removeBtn = document.getElementById('remove-password');
+      if (removeBtn) {
+        removeBtn.onclick = async () => {
+          const msg = document.getElementById('pw-msg');
+          try {
+            const res = await api('/admin/password', { method: 'DELETE' });
+            if (!res.ok) throw new Error((await res.json()).error);
+            msg.className = 'msg ok'; msg.textContent = 'Password removed';
+            setTimeout(() => refreshStatus(), 500);
+          } catch (e) { msg.className = 'msg err'; msg.textContent = e.message; }
+        };
+      }
+
+      document.getElementById('btn-restart').onclick = async () => {
+        const msg = document.getElementById('ctrl-msg');
+        if (!confirm('Restart the server?')) return;
+        try {
+          await api('/restart', { method: 'POST' });
+          msg.className = 'msg ok'; msg.textContent = 'Server restarting...';
+        } catch (e) { msg.className = 'msg err'; msg.textContent = e.message; }
+      };
+
+      document.getElementById('btn-check-update').onclick = async () => {
+        const msg = document.getElementById('ctrl-msg');
+        try {
+          const res = await api('/update/check', { method: 'POST' });
+          const data = await res.json();
+          msg.className = 'msg ok';
+          msg.textContent = data.updateAvailable ? `Update available: ${data.details?.version}` : 'Already up to date';
+        } catch (e) { msg.className = 'msg err'; msg.textContent = e.message; }
+      };
+    }
+
+    // ── Init ──
+    if (token) {
+      // Clean URL
+      if (new URLSearchParams(location.search).get('token')) {
+        history.replaceState(null, '', location.pathname);
+      }
+      loadAdmin();
+    } else {
+      showAuth();
+    }
+  </script>
+</body>
+</html>

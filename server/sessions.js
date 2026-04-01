@@ -2,49 +2,148 @@ import { spawn } from 'node-pty';
 import { EventEmitter } from 'events';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
-// ── Question / attention detection patterns ─────────────────────────
-const QUESTION_PATTERNS = [
-  /\?\s*$/m,
-  /\(y\/n\)/i, /\[Y\/n\]/i, /\[y\/N\]/i,
-  /press enter/i,
-  /do you want/i,
-  /please (choose|select|pick|confirm)/i,
-  /which (one|option)/i,
-  /enter .*(path|name|number|value)/i,
-  /approve|reject|accept|deny/i,
-  /continue\?/i,
-  /proceed\?/i,
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const SESSIONS_FILE = path.join(__dirname, '..', 'data', 'sessions.json');
+
+// ── Claude Code detection ───────────────────────────────────────────
+// Patterns that indicate Claude Code is the active process in this session.
+// Use \s* between words because terminal rendering can collapse/strip spaces.
+const CLAUDE_PRESENCE_PATTERNS = [
+  /\?\s*for\s*shortcuts/,        // Claude Code's idle prompt
+  /\(Y\)es\s*\/\s*\(N\)o/,      // Tool approval dialog
+  /esc\s*to\s*interrupt/,        // Claude Code working status bar
+  /plan\s*mode\s*on/,            // Plan mode active
 ];
 
-// Patterns that indicate Claude is actively working
-const WORKING_PATTERNS = [
-  /reading|writing|editing|creating|updating|searching/i,
-  /running|executing|installing|compiling|building/i,
-  /analyzing|processing|generating|thinking/i,
-  /\.\.\./,
+// Patterns that mean Claude Code is waiting for user input (blocked).
+const CLAUDE_INPUT_PATTERNS = [
+  /\(Y\)es\s*\/\s*\(N\)o/,      // Tool approval
+  /Yes\s*\/\s*No/,               // Simpler Yes / No variant
+  /\(y\/n\)/i, /\[Y\/n\]/i, /\[y\/N\]/i,
+  /\(yes\/no\)/i,
+  /press enter to continue/i,
+  /Do you want to proceed/i,
+  /Enter\s*to\s*select.*to\s*navigate/,  // Claude Code menu selection (plan mode, etc.)
+];
+
+// Patterns that mean Claude Code finished and returned to its idle prompt.
+const CLAUDE_IDLE_PATTERNS = [
+  /\?\s*for\s*shortcuts/,        // Claude's main idle prompt (normal mode)
+  /shift\+tab\s*to\s*cycle/,     // Plan mode idle prompt
 ];
 
 export class SessionManager extends EventEmitter {
   constructor() {
     super();
     this.sessions = new Map();
+    this._restoreSessions();
+  }
+
+  // Restore saved sessions from disk after server restart
+  _restoreSessions() {
+    try {
+      if (!fs.existsSync(SESSIONS_FILE)) return;
+      const saved = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
+      if (!Array.isArray(saved)) return;
+
+      for (const s of saved) {
+        if (!s.id || !s.cwd) continue;
+        // Skip if cwd no longer exists
+        if (!fs.existsSync(s.cwd)) continue;
+
+        // Create a placeholder session marked as 'dead' — pty is gone but metadata preserved
+        this.sessions.set(s.id, {
+          id: s.id,
+          name: s.name || 'Restored Session',
+          pid: null,
+          pty: null,
+          cwd: s.cwd,
+          shell: s.shell || process.env.SHELL || '/bin/bash',
+          cols: s.cols || 120,
+          rows: s.rows || 40,
+          status: 'dead',
+          createdAt: s.createdAt || Date.now(),
+          lastActivity: s.lastActivity || Date.now(),
+          outputBuffer: '',
+          lastOutput: '',
+          attentionPreview: null,
+          subscribers: new Set(),
+        });
+      }
+    } catch {}
+  }
+
+  _saveSessions() {
+    try {
+      const data = Array.from(this.sessions.values()).map(s => ({
+        id: s.id,
+        name: s.name,
+        cwd: s.cwd,
+        shell: s.shell,
+        cols: s.cols,
+        rows: s.rows,
+        createdAt: s.createdAt,
+        lastActivity: s.lastActivity,
+      }));
+      const dir = path.dirname(SESSIONS_FILE);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
+    } catch {}
+  }
+
+  // Reconnect a dead session — spawns a new pty in the same directory
+  reconnect(id, { cols = 120, rows = 40 } = {}) {
+    const session = this.sessions.get(id);
+    if (!session) throw new Error('Session not found');
+    if (session.pty) throw new Error('Session is already alive');
+
+    const ptyEnv = { ...process.env, TERM: 'xterm-256color' };
+    delete ptyEnv.npm_config_prefix;
+    delete ptyEnv.npm_config_local_prefix;
+
+    const pty = spawn(session.shell, ['-l'], {
+      name: 'xterm-256color',
+      cols, rows,
+      cwd: session.cwd,
+      env: ptyEnv,
+    });
+
+    session.pty = pty;
+    session.pid = pty.pid;
+    session.status = 'idle';
+    session.cols = cols;
+    session.rows = rows;
+    session.outputBuffer = '';
+    session.lastOutput = '';
+    session.lastActivity = Date.now();
+
+    this._attachPtyHandlers(session);
+    this._saveSessions();
+    this.emit('session:reconnected', id);
+    return this.serialize(session);
   }
 
   create({ name, cwd, shell = process.env.SHELL || '/bin/bash', cols = 120, rows = 40 }) {
     const id = 'sess_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
 
-    // Resolve and validate cwd
+    // Resolve cwd, create if it doesn't exist
     const resolvedCwd = cwd ? path.resolve(cwd) : (process.env.HOME || '/');
     if (!fs.existsSync(resolvedCwd)) {
-      throw new Error(`Directory not found: ${resolvedCwd}`);
+      fs.mkdirSync(resolvedCwd, { recursive: true });
     }
 
-    const pty = spawn(shell, [], {
+    // Clean env for pty — remove npm_config_prefix which breaks NVM
+    const ptyEnv = { ...process.env, TERM: 'xterm-256color' };
+    delete ptyEnv.npm_config_prefix;
+    delete ptyEnv.npm_config_local_prefix;
+
+    const pty = spawn(shell, ['-l'], {
       name: 'xterm-256color',
       cols, rows,
       cwd: resolvedCwd,
-      env: { ...process.env, TERM: 'xterm-256color' },
+      env: ptyEnv,
     });
 
     const session = {
@@ -64,79 +163,117 @@ export class SessionManager extends EventEmitter {
       subscribers: new Set(),    // WebSocket clients watching this session
     };
 
-    // ── Output handler ──────────────────────────────────────────
-    pty.onData((data) => {
+    this._attachPtyHandlers(session);
+
+    this.sessions.set(id, session);
+    this._saveSessions();
+    this.emit('session:created', id);
+    return this.serialize(session);
+  }
+
+  _attachPtyHandlers(session) {
+    const id = session.id;
+    session.pty.onData((data) => {
       session.lastActivity = Date.now();
       session.outputBuffer += data;
       session.lastOutput = data;
 
-      // Cap buffer at 100KB
       if (session.outputBuffer.length > 100_000) {
         session.outputBuffer = session.outputBuffer.slice(-60_000);
       }
 
-      // Detect status from output
       const clean = stripAnsi(data);
       this._detectStatus(session, clean);
 
-      // Broadcast to subscribers
       const msg = JSON.stringify({ type: 'output', sessionId: id, data });
       for (const ws of session.subscribers) {
         if (ws.readyState === 1) ws.send(msg);
       }
     });
 
-    pty.onExit(({ exitCode }) => {
+    session.pty.onExit(({ exitCode }) => {
       session.status = 'done';
+      session.pty = null;
+      session.pid = null;
+      this._saveSessions();
       const msg = JSON.stringify({ type: 'session:exit', sessionId: id, exitCode });
       for (const ws of session.subscribers) {
         if (ws.readyState === 1) ws.send(msg);
       }
       this.emit('session:exit', id, exitCode);
     });
-
-    this.sessions.set(id, session);
-    this.emit('session:created', id);
-    return this.serialize(session);
   }
 
   _detectStatus(session, cleanText) {
-    const recent = stripAnsi(session.outputBuffer.slice(-600));
+    if (cleanText.trim().length === 0) return;
 
-    // Check for question/waiting patterns
-    for (const pat of QUESTION_PATTERNS) {
-      if (pat.test(recent)) {
+    // Detect Claude Code presence in this session
+    if (!session._claudeActive) {
+      for (const pat of CLAUDE_PRESENCE_PATTERNS) {
+        if (pat.test(cleanText)) {
+          session._claudeActive = true;
+          break;
+        }
+      }
+    }
+
+    // Check the tail of the buffer for known patterns
+    const tail = stripAnsi(session.outputBuffer.slice(-600)).replace(/\r+/g, '\n');
+    const lastLines = tail.split('\n').filter(l => l.trim()).slice(-8).join('\n');
+
+    // 1. Check for Claude waiting for input (tool approval, y/n, etc.)
+    for (const pat of CLAUDE_INPUT_PATTERNS) {
+      if (pat.test(lastLines)) {
         const prev = session.status;
         session.status = 'waiting';
-        session.attentionPreview = recent.slice(-200).trim();
+        // Find a meaningful preview line — skip UI chrome like "cancel", "navigate", etc.
+        const previewLines = lastLines.trim().split('\n').filter(l =>
+          l.trim() && !/^(cancel|Enter\s*to\s*select|to\s*navigate|Esc\s*to)/.test(l.trim())
+        );
+        session.attentionPreview = previewLines.pop() || 'Claude has a question';
+        if (session._idleTimer) clearTimeout(session._idleTimer);
 
-        if (prev !== 'waiting') {
-          const msg = JSON.stringify({
-            type: 'session:attention',
-            sessionId: session.id,
-            preview: session.attentionPreview,
-          });
-          for (const ws of session.subscribers) {
-            if (ws.readyState === 1) ws.send(msg);
-          }
-          this.emit('session:attention', session.id, session.attentionPreview);
+        const now = Date.now();
+        if (prev !== 'waiting' && (!session._lastAttention || now - session._lastAttention > 10000)) {
+          session._lastAttention = now;
+          session._attentionReason = 'prompt';
+          this.emit('session:attention', session.id, 'prompt', session.attentionPreview);
         }
         return;
       }
     }
 
-    // Check for working patterns
-    for (const pat of WORKING_PATTERNS) {
-      if (pat.test(cleanText)) {
-        session.status = 'working';
-        return;
+    // 2. Check if Claude returned to its idle prompt (finished working)
+    if (session._claudeActive) {
+      for (const pat of CLAUDE_IDLE_PATTERNS) {
+        if (pat.test(lastLines)) {
+          // Claude's idle prompt appeared — schedule notification after debounce
+          if (session.status === 'working') {
+            this._scheduleIdleNotification(session);
+          }
+          return;
+        }
       }
     }
 
-    // Default: if output is flowing, it's working
-    if (cleanText.trim().length > 0) {
-      session.status = 'working';
-    }
+    // 3. If none of the above matched, session is actively producing output
+    session.status = 'working';
+    if (session._idleTimer) clearTimeout(session._idleTimer);
+  }
+
+  // Notify after Claude's idle prompt settles (debounce to avoid false triggers during streaming)
+  _scheduleIdleNotification(session) {
+    if (session._idleTimer) clearTimeout(session._idleTimer);
+    session._idleTimer = setTimeout(() => {
+      if (session.status !== 'working') return;
+      session.status = 'idle';
+      const now = Date.now();
+      if (!session._lastAttention || now - session._lastAttention > 10000) {
+        session._lastAttention = now;
+        session._attentionReason = 'idle';
+        this.emit('session:attention', session.id, 'idle', null);
+      }
+    }, 2000);
   }
 
   write(id, data) {
@@ -147,6 +284,7 @@ export class SessionManager extends EventEmitter {
     if (session.status === 'waiting') {
       session.status = 'working';
       session.attentionPreview = null;
+      session._attentionReason = null;
     }
 
     session.pty.write(data);
@@ -165,6 +303,7 @@ export class SessionManager extends EventEmitter {
     const session = this.sessions.get(id);
     if (!session) throw new Error('Session not found');
     session.name = name;
+    this._saveSessions();
     this.emit('session:updated', id);
     return this.serialize(session);
   }
@@ -173,7 +312,9 @@ export class SessionManager extends EventEmitter {
     const session = this.sessions.get(id);
     if (!session) return;
 
-    try { session.pty.kill(); } catch {}
+    if (session.pty) {
+      try { session.pty.kill(); } catch {}
+    }
 
     const msg = JSON.stringify({ type: 'session:killed', sessionId: id });
     for (const ws of session.subscribers) {
@@ -182,6 +323,7 @@ export class SessionManager extends EventEmitter {
 
     session.subscribers.clear();
     this.sessions.delete(id);
+    this._saveSessions();
     this.emit('session:killed', id);
   }
 
@@ -245,6 +387,8 @@ export class SessionManager extends EventEmitter {
       createdAt: session.createdAt,
       lastActivity: session.lastActivity,
       attentionPreview: session.attentionPreview,
+      attentionReason: session._attentionReason || null,
+      attentionAt: session._lastAttention || null,
       subscriberCount: session.subscribers.size,
     };
   }
@@ -252,7 +396,9 @@ export class SessionManager extends EventEmitter {
 
 function stripAnsi(str) {
   return str
-    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
-    .replace(/\x1b\][^\x07]*\x07/g, '')
-    .replace(/\x1b[()][AB012]/g, '');
+    .replace(/\x1b\[[\x20-\x3f]*[\x40-\x7e]/g, '')  // All CSI sequences
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')  // OSC sequences
+    .replace(/\x1b[()][AB012]/g, '')             // Character set selection
+    .replace(/\x1b[\x20-\x2f]*[\x30-\x7e]/g, '') // Other escape sequences
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');  // Control characters
 }
