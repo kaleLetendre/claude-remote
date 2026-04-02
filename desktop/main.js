@@ -29,6 +29,12 @@ function readSettings() {
   } catch {}
 }
 
+// Read settings early so we know the port for the instance lock
+readSettings();
+
+// Use a unique user-data dir per port so prod (3033) and dev (3034) don't conflict
+app.setPath('userData', path.join(app.getPath('userData'), '..', `claude-remote-${serverPort}`));
+
 function getConnectionInfoPath() {
   const p = path.join(DATA_DIR, 'connection-info.json');
   if (fs.existsSync(p)) return p;
@@ -162,7 +168,6 @@ if (!gotLock) {
 app.on('ready', () => {
   if (process.platform === 'darwin') app.dock.hide();
 
-  readSettings();
   createTray();
 
   // Start health checking
