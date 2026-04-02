@@ -19,6 +19,8 @@ const state = {
   ttsEnabled: false,
   smartTts: false,
   alertsEnabled: true,
+  alertPrompt: true,
+  alertIdle: true,
   speechRate: 1.1,
   selectedVoiceURI: null,
   sttLang: 'en-US',
@@ -52,7 +54,7 @@ function loadSettings() {
 
 function saveSettings() {
   const keys = [
-    'ttsEnabled', 'smartTts', 'alertsEnabled', 'speechRate',
+    'ttsEnabled', 'smartTts', 'alertsEnabled', 'alertPrompt', 'alertIdle', 'speechRate',
     'selectedVoiceURI', 'sttLang', 'serverUrl', 'token',
   ];
   const obj = {};
@@ -823,14 +825,14 @@ function initTerminal() {
     theme: {
       background: '#0b0c10',
       foreground: '#e4e6f0',
-      cursor: '#a080f0',
-      selectionBackground: 'rgba(160,128,240,0.25)',
+      cursor: '#4ae08c',
+      selectionBackground: 'rgba(74,224,140,0.25)',
       black: '#1a1c26',
       red: '#f06070',
       green: '#4ae08c',
       yellow: '#f0c050',
       blue: '#60a0f0',
-      magenta: '#a080f0',
+      magenta: '#4ae08c',
       cyan: '#60d0e0',
       white: '#e4e6f0',
       brightBlack: '#4e526a',
@@ -838,7 +840,7 @@ function initTerminal() {
       brightGreen: '#6ae0a0',
       brightYellow: '#f0d070',
       brightBlue: '#80b0f0',
-      brightMagenta: '#b0a0f0',
+      brightMagenta: '#6ae0a0',
       brightCyan: '#80e0f0',
       brightWhite: '#ffffff',
     },
@@ -887,6 +889,8 @@ function initTerminal() {
     if (resizeTimer) clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
       if (!state.xterm || keyboardOpen || keyboardTransitioning) return;
+      // Don't resize during active output — causes scroll flash
+      if (Date.now() - _lastWriteTime < 500) return;
       const vp = container.querySelector('.xterm-viewport');
       const prevScroll = vp ? vp.scrollTop : 0;
       const atBottom = !vp || (vp.scrollHeight - vp.scrollTop - vp.clientHeight < 80);
@@ -995,26 +999,26 @@ function destroyTerminal() {
 let _scrollLocked = false;
 let _lockScrollPos = 0;
 
+let _lastWriteTime = 0;
+
 function appendTerminalOutput(data) {
   if (!state.xterm) return;
+  _lastWriteTime = Date.now();
 
   const vp = document.querySelector('#xterm-container .xterm-viewport');
   const atBottom = !vp || (vp.scrollHeight - vp.scrollTop - vp.clientHeight < 80);
 
   if (!atBottom && vp) {
-    // User is scrolled up — lock scroll position during the write
+    // User is scrolled up — save line position, write, restore
+    const savedLine = state.xterm.buffer.active.viewportY;
     _scrollLocked = true;
-    _lockScrollPos = vp.scrollTop;
 
     state.xterm.write(data, () => {
-      vp.scrollTop = _lockScrollPos;
-      // Keep lock active briefly to catch any deferred reflows
-      requestAnimationFrame(() => {
-        vp.scrollTop = _lockScrollPos;
-        _scrollLocked = false;
-      });
+      state.xterm.scrollToLine(savedLine);
+      requestAnimationFrame(() => { _scrollLocked = false; });
     });
   } else {
+    // At bottom — just write, xterm auto-scrolls
     state.xterm.write(data);
   }
 
@@ -1024,14 +1028,7 @@ function appendTerminalOutput(data) {
 // Intercept scroll events on the xterm viewport to enforce the lock.
 // This catches xterm's synchronous scroll-to-bottom during write().
 function installScrollLock() {
-  const vp = document.querySelector('#xterm-container .xterm-viewport');
-  if (!vp || vp._scrollLockInstalled) return;
-  vp._scrollLockInstalled = true;
-  vp.addEventListener('scroll', () => {
-    if (_scrollLocked) {
-      vp.scrollTop = _lockScrollPos;
-    }
-  }, { passive: false });
+  // No longer needed — scroll lock is handled via xterm.scrollToLine() in the write callback
 }
 
 function escapeHtml(s) {
@@ -1108,7 +1105,8 @@ function handleAttention(sessionId, reason, preview) {
   // Skip if user is actively viewing this session
   if (state.currentView === 'session' && state.activeSessionId === sessionId && !document.hidden) return;
 
-  if (!state.alertsEnabled) return;
+  if (reason === 'prompt' && !state.alertPrompt) return;
+  if (reason === 'idle' && !state.alertIdle) return;
 
   if (reason === 'prompt') {
     // Claude is blocked waiting for user input
@@ -1342,83 +1340,14 @@ function initSettings() {
       state[key] = toggle.classList.contains('on');
       saveSettings();
 
-      // Sync TTS header button
-      const vBtn = $('#btn-voice');
-      if (key === 'ttsEnabled' && vBtn) {
-        vBtn.classList.toggle('active', state.ttsEnabled);
-        if (!state.ttsEnabled) speechSynthesis.cancel();
-      }
     };
   });
-
-  // Notification permission — handled by bootstrap's Capacitor Local Notifications
-  // The bootstrap page (parent) manages native notifications via polling.
-  // This button requests Web Notification permission as a fallback.
-  const notifBtn = $('#btn-notif-perm');
-  if (notifBtn) {
-    // Check if running inside bootstrap iframe (Capacitor handles notifications)
-    if (window.parent !== window) {
-      notifBtn.textContent = 'Managed by App';
-      notifBtn.disabled = true;
-    } else if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-      notifBtn.textContent = 'Enabled ✓';
-    }
-    notifBtn.onclick = () => {
-      if (typeof Notification !== 'undefined') {
-        Notification.requestPermission().then(p => {
-          notifBtn.textContent = p === 'granted' ? 'Enabled ✓' : 'Denied';
-        });
-      }
-    };
-  }
-
-  // Voice select
-  const voiceSel = $('#sel-voice');
-  function populateVoices() {
-    const voices = speechSynthesis.getVoices();
-    voiceSel.innerHTML = '<option value="">Default</option>';
-    voices.forEach(v => {
-      const opt = document.createElement('option');
-      opt.value = v.voiceURI;
-      opt.textContent = `${v.name} (${v.lang})`;
-      if (v.voiceURI === state.selectedVoiceURI) opt.selected = true;
-      voiceSel.appendChild(opt);
-    });
-  }
-  speechSynthesis.onvoiceschanged = populateVoices;
-  populateVoices();
-
-  voiceSel.onchange = () => {
-    state.selectedVoiceURI = voiceSel.value || null;
-    saveSettings();
-  };
-
-  // Rate
-  const rateRange = $('#rate-range');
-  const rateVal = $('#rate-val');
-  rateRange.value = state.speechRate;
-  rateVal.textContent = ` ${state.speechRate.toFixed(1)}×`;
-  rateRange.oninput = () => {
-    state.speechRate = parseFloat(rateRange.value);
-    rateVal.textContent = ` ${state.speechRate.toFixed(1)}×`;
-    saveSettings();
-  };
-
-  // STT language
-  const langSel = $('#sel-lang');
-  langSel.value = state.sttLang;
-  langSel.onchange = () => {
-    state.sttLang = langSel.value;
-    saveSettings();
-  };
 
   // Server URL display
   const serverUrl = $('#setting-server-url');
   if (serverUrl) serverUrl.textContent = state.serverUrl || location.origin;
 
   // Version + Git info
-  fetchVersionInfo();
-
   // Disconnect button
   const disconnectBtn = $('#btn-disconnect');
   if (disconnectBtn) {
@@ -1429,84 +1358,109 @@ function initSettings() {
     });
   }
 
-  // Check for updates button
-  const checkBtn = $('#btn-check-update');
-  if (checkBtn) {
-    checkBtn.onclick = async () => {
-      checkBtn.textContent = 'Checking…';
-      checkBtn.disabled = true;
+  // Server update check
+  const serverBtn = $('#btn-check-server-update');
+  if (serverBtn) {
+    // Show current server version on load
+    api.get('/api/version').then(data => {
+      const el = $('#setting-version');
+      if (el) el.textContent = data.version ? `v${data.version}` : '—';
+    }).catch(() => {});
+
+    serverBtn.onclick = async () => {
+      const statusEl = $('#setting-server-update-status');
+      serverBtn.textContent = 'Checking…';
+      serverBtn.disabled = true;
       try {
         const res = await fetch(`${api.baseUrl}/api/update/check?token=${state.token}`, {
           method: 'POST', headers: api.headers(),
         });
         const data = await res.json();
-        const statusEl = $('#setting-update-status');
         if (data.updateAvailable) {
-          statusEl.textContent = `${data.details.newVersion} available (${data.details.commitsBehind} commits)`;
+          statusEl.textContent = `${data.details.newVersion} available`;
           statusEl.style.color = 'var(--accent)';
-          checkBtn.textContent = 'Update & Restart';
-          checkBtn.disabled = false;
-          checkBtn.onclick = applyUpdate;
+          serverBtn.textContent = 'Update & Refresh';
+          serverBtn.disabled = false;
+          serverBtn.onclick = async () => {
+            serverBtn.textContent = 'Updating…';
+            serverBtn.disabled = true;
+            try {
+              const res = await fetch(`${api.baseUrl}/api/update/apply?token=${state.token}`, {
+                method: 'POST', headers: api.headers(),
+              });
+              const result = await res.json();
+              if (result.success) {
+                statusEl.textContent = 'Restarting…';
+                setTimeout(() => location.reload(), 5000);
+              }
+            } catch {
+              statusEl.textContent = 'Update failed';
+              serverBtn.textContent = 'Retry';
+              serverBtn.disabled = false;
+            }
+          };
         } else {
           statusEl.textContent = 'Up to date';
           statusEl.style.color = 'var(--green)';
-          checkBtn.textContent = 'Check';
-          checkBtn.disabled = false;
+          serverBtn.textContent = 'Check';
+          serverBtn.disabled = false;
         }
-      } catch (err) {
-        const statusEl = $('#setting-update-status');
+      } catch {
         statusEl.textContent = 'Check failed';
         statusEl.style.color = 'var(--red)';
-        checkBtn.textContent = 'Retry';
-        checkBtn.disabled = false;
+        serverBtn.textContent = 'Retry';
+        serverBtn.disabled = false;
       }
     };
   }
-}
 
-async function fetchVersionInfo() {
-  try {
-    const data = await api.get('/api/version');
-    const versionEl = $('#setting-version');
-    const gitEl = $('#setting-git-info');
-    if (versionEl) versionEl.textContent = `v${data.version}`;
-    if (gitEl) {
-      if (data.git?.isGit) {
-        const dirty = data.git.dirty ? ' (modified)' : '';
-        gitEl.textContent = `${data.git.branch}@${data.git.commit}${dirty}`;
-      } else {
-        gitEl.textContent = 'Not a git repo — updates disabled';
-      }
-    }
-    // Show update status if already known
-    if (data.updateAvailable) {
-      const statusEl = $('#setting-update-status');
-      if (statusEl) {
-        statusEl.textContent = `${data.updateAvailable.newVersion} available`;
-        statusEl.style.color = 'var(--accent)';
-      }
-    }
-  } catch {}
-}
+  // App update check
+  const appBtn = $('#btn-check-app-update');
+  if (appBtn) {
+    // Show current app version (from URL param set by bootstrap)
+    const params = new URLSearchParams(location.search);
+    const clientVersion = params.get('v') || 'unknown';
+    const appVersionEl = $('#setting-app-version');
+    if (appVersionEl) appVersionEl.textContent = `v${clientVersion}`;
 
-async function applyUpdate() {
-  const btn = $('#btn-check-update');
-  const statusEl = $('#setting-update-status');
-  if (btn) { btn.textContent = 'Updating…'; btn.disabled = true; }
-  try {
-    const res = await fetch(`${api.baseUrl}/api/update/apply?token=${state.token}`, {
-      method: 'POST', headers: api.headers(),
-    });
-    const result = await res.json();
-    if (result.success) {
-      if (statusEl) statusEl.textContent = `Updated to v${result.version} — restarting…`;
-      if (btn) btn.textContent = 'Restarting…';
-      // Server will restart, reload page after a delay to get new assets
-      setTimeout(() => location.reload(), 5000);
-    }
-  } catch {
-    if (statusEl) statusEl.textContent = 'Update failed';
-    if (btn) { btn.textContent = 'Retry'; btn.disabled = false; }
+    appBtn.onclick = async () => {
+      const statusEl = $('#setting-app-update-status');
+      appBtn.textContent = 'Checking…';
+      appBtn.disabled = true;
+      try {
+        const res = await fetch(`${api.baseUrl}/api/app/version`);
+        const data = await res.json();
+        if (data.version && data.version !== clientVersion) {
+          statusEl.textContent = `${clientVersion} → ${data.version}`;
+          statusEl.style.color = 'var(--accent)';
+          appBtn.textContent = 'Download';
+          appBtn.disabled = false;
+          appBtn.onclick = () => {
+            const url = `${api.baseUrl}/api/app/download`;
+            if (window.parent !== window) {
+              window.parent.postMessage({ type: 'download-apk', url }, '*');
+            } else {
+              window.open(url, '_blank');
+            }
+          };
+        } else if (!data.hasApk) {
+          statusEl.textContent = 'No APK available on server';
+          statusEl.style.color = 'var(--text-2)';
+          appBtn.textContent = 'Check';
+          appBtn.disabled = false;
+        } else {
+          statusEl.textContent = 'Up to date';
+          statusEl.style.color = 'var(--green)';
+          appBtn.textContent = 'Check';
+          appBtn.disabled = false;
+        }
+      } catch {
+        statusEl.textContent = 'Check failed';
+        statusEl.style.color = 'var(--red)';
+        appBtn.textContent = 'Retry';
+        appBtn.disabled = false;
+      }
+    };
   }
 }
 
@@ -1526,6 +1480,17 @@ function disconnectServer() {
 // ── Top-level event binding ─────────────────────────────────
 
 $('#btn-back').onclick = () => navigate('dashboard');
+
+// Android back button — intercept via popstate
+window.addEventListener('popstate', () => {
+  if (state.currentView === 'session' || state.currentView === 'settings') {
+    navigate('dashboard');
+  }
+  // Push a dummy state so the next back press is also caught
+  history.pushState(null, '', location.href);
+});
+// Seed initial state
+history.pushState(null, '', location.href);
 $('#btn-settings').onclick = () => {
   if (state.currentView === 'settings') navigate('dashboard');
   else navigate('settings');

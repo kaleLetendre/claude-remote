@@ -169,42 +169,12 @@
 
     <div class="setting-group">
       <div class="setting-row">
-        <div><span class="setting-name">Text-to-Speech</span><br><span class="setting-desc">Read Claude's output aloud</span></div>
-        <div class="toggle-switch" data-key="ttsEnabled"></div>
+        <div><span class="setting-name">Input Required</span><br><span class="setting-desc">Notify when Claude needs your response</span></div>
+        <div class="toggle-switch on" data-key="alertPrompt"></div>
       </div>
       <div class="setting-row">
-        <div><span class="setting-name">Smart TTS</span><br><span class="setting-desc">Only speak Claude's words, skip shell noise</span></div>
-        <div class="toggle-switch" data-key="smartTts"></div>
-      </div>
-      <div class="setting-row">
-        <div><span class="setting-name">Attention Alerts</span><br><span class="setting-desc">Vibrate when Claude asks a question</span></div>
-        <div class="toggle-switch on" data-key="alertsEnabled"></div>
-      </div>
-      <div class="setting-row">
-        <div><span class="setting-name">Notifications</span><br><span class="setting-desc">Background push notifications</span></div>
-        <button class="btn-secondary btn-sm" id="btn-notif-perm">Enable</button>
-      </div>
-    </div>
-
-    <div class="setting-group">
-      <div class="setting-row">
-        <div><span class="setting-name">Voice</span></div>
-        <select class="field-select" id="sel-voice"></select>
-      </div>
-      <div class="setting-row">
-        <div><span class="setting-name">Speed</span><span class="setting-desc" id="rate-val"> 1.1×</span></div>
-        <input type="range" min="0.5" max="2.5" step="0.1" value="1.1" id="rate-range" class="range-input">
-      </div>
-      <div class="setting-row">
-        <div><span class="setting-name">STT Language</span></div>
-        <select class="field-select" id="sel-lang">
-          <option value="en-US">English (US)</option>
-          <option value="en-GB">English (UK)</option>
-          <option value="es-ES">Spanish</option>
-          <option value="fr-FR">French</option>
-          <option value="de-DE">German</option>
-          <option value="ja-JP">Japanese</option>
-        </select>
+        <div><span class="setting-name">Output Finished</span><br><span class="setting-desc">Notify when Claude finishes working</span></div>
+        <div class="toggle-switch on" data-key="alertIdle"></div>
       </div>
     </div>
 
@@ -218,18 +188,22 @@
     <div class="setting-group">
       <div class="setting-row">
         <div>
-          <span class="setting-name">Version</span>
+          <span class="setting-name">Server</span>
           <span class="version-badge" id="setting-version">—</span>
-          <br><span class="setting-desc" id="setting-git-info">—</span>
+          <br><span class="setting-desc" id="setting-server-update-status"></span>
         </div>
+        <button class="btn-secondary btn-sm" id="btn-check-server-update">Check</button>
       </div>
+    </div>
+
+    <div class="setting-group">
       <div class="setting-row">
-        <div><span class="setting-name">Check for updates</span><br><span class="setting-desc" id="setting-update-status">Not checked</span></div>
-        <button class="btn-secondary btn-sm" id="btn-check-update">Check</button>
-      </div>
-      <div class="setting-row">
-        <div><span class="setting-name">Auto-update</span><br><span class="setting-desc">Check for updates every 5 minutes</span></div>
-        <div class="toggle-switch" data-key="autoUpdate"></div>
+        <div>
+          <span class="setting-name">App</span>
+          <span class="version-badge" id="setting-app-version">—</span>
+          <br><span class="setting-desc" id="setting-app-update-status"></span>
+        </div>
+        <button class="btn-secondary btn-sm" id="btn-check-app-update">Check</button>
       </div>
     </div>
   </div>

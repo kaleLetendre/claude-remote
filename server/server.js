@@ -429,6 +429,56 @@ function detectIPs() {
   return { lanIp: lanIp || 'unknown', tailscaleIp };
 }
 
+// ── Tray icon (desktop only) ────────────────────────────────────────
+
+import { spawn as cpSpawn } from 'child_process';
+
+let trayProcess = null;
+
+function launchTray() {
+  // Skip on headless systems (no display server)
+  const hasDisplay = process.env.DISPLAY || process.env.WAYLAND_DISPLAY || process.platform === 'darwin' || process.platform === 'win32';
+  if (!hasDisplay) return;
+
+  // Check if Electron is installed in the desktop directory
+  const desktopDir = join(PACKAGE_ROOT, 'desktop');
+  const electronBin = join(desktopDir, 'node_modules', '.bin', 'electron');
+  if (!existsSync(electronBin) && !existsSync(electronBin + '.cmd')) return;
+
+  // Don't launch if already running (single instance lock in Electron handles this)
+  if (trayProcess) return;
+
+  const env = { ...process.env, ELECTRON_DISABLE_SANDBOX: '1' };
+  if (process.env.CLAUDE_REMOTE_DATA) {
+    env.CLAUDE_REMOTE_DATA = process.env.CLAUDE_REMOTE_DATA;
+  }
+
+  let trayLastSpawn = 0;
+
+  function spawnTray() {
+    const now = Date.now();
+    // If it crashed within 5s of spawning, it's probably a lock conflict — back off
+    if (trayProcess === null && now - trayLastSpawn < 5000) {
+      setTimeout(spawnTray, 30000);
+      return;
+    }
+    trayLastSpawn = now;
+
+    trayProcess = cpSpawn(electronBin, [desktopDir], {
+      stdio: 'ignore',
+      env,
+    });
+
+    trayProcess.on('exit', () => {
+      trayProcess = null;
+      // Re-launch — tray must stay alive while server is running
+      setTimeout(spawnTray, 3000);
+    });
+  }
+
+  spawnTray();
+}
+
 // ── Start ───────────────────────────────────────────────────────────
 server.listen(PORT, '0.0.0.0', () => {
   const { lanIp, tailscaleIp } = detectIPs();
@@ -480,4 +530,7 @@ server.listen(PORT, '0.0.0.0', () => {
     writeFileSync(getConnectionInfoPath(), connInfo);
   } catch {
   }
+
+  // Launch tray icon if on a desktop (has DISPLAY/WAYLAND) and Electron is installed
+  launchTray();
 });

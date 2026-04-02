@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>Claude Remote</title>
-  <meta name="app-version" content="0.2.0">
+  <meta name="app-version" content="0.2.1">
   <style>
     :root {
       --bg-0: #0b0c10; --bg-2: #1a1c26;
@@ -399,6 +399,8 @@
         _authToken = '';
         document.body.classList.remove('app-loaded');
         document.getElementById('app-frame').src = '';
+        const msg = document.getElementById('msg');
+        if (msg) { msg.className = 'msg'; msg.textContent = ''; }
       }
       if (e.data?.type === 'download-apk' && e.data.url) {
         // Open download URL in system browser

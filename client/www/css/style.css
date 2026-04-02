@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════
-   Claude Remote — Industrial Terminal Aesthetic
+   Claude Remote — 80s Terminal Aesthetic
    ═══════════════════════════════════════════════════════ */
 
 :root {
@@ -33,9 +33,9 @@
   --blue: #60a0f0;
   --blue-bg: rgba(96, 160, 240, 0.06);
 
-  --accent: #a080f0;
-  --accent-bg: rgba(160, 128, 240, 0.08);
-  --accent-border: rgba(160, 128, 240, 0.25);
+  --accent: #4ae08c;
+  --accent-bg: rgba(74, 224, 140, 0.08);
+  --accent-border: rgba(74, 224, 140, 0.2);
 
   --font-ui: 'Outfit', system-ui, sans-serif;
   --font-mono: 'IBM Plex Mono', 'Menlo', monospace;

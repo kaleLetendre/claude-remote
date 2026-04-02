@@ -221,21 +221,58 @@ async function cmdApplyUpdate() {
 }
 
 async function cmdBuildApk() {
+  const isDev = args.includes('--dev');
   const clientDir = join(PACKAGE_ROOT, 'client');
   const androidDir = join(clientDir, 'android');
+  const buildGradle = join(androidDir, 'app', 'build.gradle');
+  const stringsXml = join(androidDir, 'app', 'src', 'main', 'res', 'values', 'strings.xml');
 
-  console.log(C.dim('Syncing Capacitor...'));
-  execSync('npx cap sync android', { cwd: clientDir, stdio: 'inherit' });
+  // For dev builds, temporarily patch app ID, name, and manifest
+  let origGradle, origStrings, origManifest;
+  const manifestXml = join(androidDir, 'app', 'src', 'main', 'AndroidManifest.xml');
+  if (isDev) {
+    console.log(C.dim('Patching for dev build (com.clauderemote.dev / CR Dev)...'));
+    const { writeFileSync } = await import('fs');
 
-  console.log(C.dim('Building APK...'));
-  execSync('./gradlew assembleDebug', { cwd: androidDir, stdio: 'inherit' });
+    origGradle = readFileSync(buildGradle, 'utf8');
+    origStrings = readFileSync(stringsXml, 'utf8');
+    origManifest = readFileSync(manifestXml, 'utf8');
 
-  const apkPath = join(androidDir, 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
-  if (existsSync(apkPath)) {
-    const size = (readFileSync(apkPath).length / 1024 / 1024).toFixed(1);
-    console.log(`\n${C.green('APK built')} (${size} MB)`);
-    console.log(`  ${C.dim(apkPath)}`);
-    console.log(`  Download from server: ${getBaseUrl()}/api/app/download`);
+    writeFileSync(buildGradle, origGradle
+      .replace(/namespace "com\.clauderemote\.app"/, 'namespace "com.clauderemote.dev"')
+      .replace(/applicationId "com\.clauderemote\.app"/, 'applicationId "com.clauderemote.dev"'));
+    writeFileSync(stringsXml, origStrings
+      .replace(/<string name="app_name">Claude Remote<\/string>/, '<string name="app_name">CR Dev</string>')
+      .replace(/<string name="title_activity_main">Claude Remote<\/string>/, '<string name="title_activity_main">CR Dev</string>')
+      .replace(/com\.clauderemote\.app/g, 'com.clauderemote.dev'));
+    // Use fully qualified class names so they resolve despite different namespace
+    writeFileSync(manifestXml, origManifest
+      .replace(/android:name="\.MainActivity"/, 'android:name="com.clauderemote.app.MainActivity"')
+      .replace(/android:name="\.AttentionPollerService"/, 'android:name="com.clauderemote.app.AttentionPollerService"'));
+  }
+
+  try {
+    console.log(C.dim('Syncing Capacitor...'));
+    execSync('npx cap sync android', { cwd: clientDir, stdio: 'inherit' });
+
+    console.log(C.dim('Building APK...'));
+    execSync('./gradlew assembleDebug', { cwd: androidDir, stdio: 'inherit' });
+
+    const apkPath = join(androidDir, 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
+    if (existsSync(apkPath)) {
+      const size = (readFileSync(apkPath).length / 1024 / 1024).toFixed(1);
+      console.log(`\n${C.green('APK built')} (${size} MB)${isDev ? ' [dev]' : ''}`);
+      console.log(`  ${C.dim(apkPath)}`);
+      console.log(`  Download from server: ${getBaseUrl()}/api/app/download`);
+    }
+  } finally {
+    // Restore original files for dev builds
+    if (isDev && origGradle) {
+      const { writeFileSync } = await import('fs');
+      writeFileSync(buildGradle, origGradle);
+      writeFileSync(stringsXml, origStrings);
+      writeFileSync(manifestXml, origManifest);
+    }
   }
 }
 
