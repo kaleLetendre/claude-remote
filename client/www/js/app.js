@@ -1738,6 +1738,23 @@ let keyboardTransitioning = false;
     // Always update app height to match visible viewport
     updateAppHeight();
 
+    if (keyboardOpen && !wasOpen) {
+      // Keyboard just opened — refit terminal to smaller viewport and scroll to bottom
+      setTimeout(() => {
+        if (state.xterm && state.fitAddon) {
+          state.fitAddon.fit();
+          wsSend({
+            type: 'resize',
+            sessionId: state.activeSessionId,
+            cols: state.xterm.cols,
+            rows: state.xterm.rows,
+          });
+        }
+        const viewport = document.querySelector('#xterm-container .xterm-viewport');
+        if (viewport) viewport.scrollTop = viewport.scrollHeight;
+      }, 100);
+    }
+
     if (!keyboardOpen && wasOpen) {
       // Keyboard just closed — suppress ResizeObserver fit() during the close animation
       keyboardTransitioning = true;
