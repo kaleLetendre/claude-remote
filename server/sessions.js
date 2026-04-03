@@ -331,9 +331,19 @@ export class SessionManager extends EventEmitter {
         }
         break;
       }
-      case 'stop':
-        // No-op — idle_prompt notification handles the idle transition.
+      case 'stop': {
+        const wasWorking = session.status === 'working';
+        session.status = 'idle';
+        if (wasWorking) {
+          const now = Date.now();
+          if (!session._lastAttention || now - session._lastAttention > 10000) {
+            session._lastAttention = now;
+            session._attentionReason = 'idle';
+            this.emit('session:attention', session.id, 'idle', null);
+          }
+        }
         break;
+      }
       case 'user_prompt_submit':
         session.status = 'working';
         session.attentionPreview = null;
