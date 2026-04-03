@@ -330,8 +330,7 @@ export class SessionManager extends EventEmitter {
         break;
       }
       case 'stop':
-        // Claude finished responding — idle_prompt notification usually follows shortly
-        session.status = 'idle';
+        // No-op — idle_prompt notification handles the idle transition.
         break;
       case 'user_prompt_submit':
         session.status = 'working';
