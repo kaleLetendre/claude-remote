@@ -72,6 +72,7 @@ The APK only bundles a login screen. After authentication, it loads the full UI 
 **Server** (`server/`) — Node.js + Express + WebSocket + node-pty
 - Manages multiple independent terminal sessions (real pseudo-terminals)
 - Detects when Claude asks questions and pushes attention alerts
+- Status detection via Claude Code hooks (primary) with regex fallback for non-Claude sessions
 - Tracks session status: `idle` → `working` → `waiting` → `done`
 - REST API for session CRUD, file browsing, auth, and admin
 - WebSocket for real-time terminal I/O streaming
@@ -93,7 +94,7 @@ The APK only bundles a login screen. After authentication, it loads the full UI 
 
 **CLI** (`cli.js`) — Headless management tool
 - Everything the admin panel can do, from the command line
-- Commands: `setup`, `start`, `status`, `token`, `url`, `clients`, `sessions`, `set-password`, `remove-password`, `restart`, `check-update`, `apply-update`, `build-apk`
+- Commands: `setup`, `start`, `status`, `token`, `url`, `clients`, `sessions`, `set-password`, `remove-password`, `restart`, `check-update`, `apply-update`, `build-apk`, `setup-hooks`
 
 **Bootstrap** (`client/bootstrap/`) — Login screen bundled in the APK
 - Password field (primary) with token as advanced fallback
@@ -187,6 +188,7 @@ ssh -L 3033:localhost:3033 user@your-machine
 ./cli.js check-update     # Check for updates
 ./cli.js apply-update     # Apply available update
 ./cli.js build-apk        # Build Android APK (--dev for dev build)
+./cli.js setup-hooks      # Configure Claude Code hooks for notifications
 ```
 
 ## Project Structure

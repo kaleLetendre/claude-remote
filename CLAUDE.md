@@ -40,8 +40,9 @@ The user wants to go for a walk while Claude Code works on their computer. They 
 - WebSocket streams terminal I/O in real time
 - `node-pty` spawns real pseudo-terminals (one per session)
 - REST API for session CRUD, file browsing, auth, admin, version/update management
-- Detects when Claude asks questions (regex patterns on output) and pushes `session:attention` alerts
+- Detects when Claude asks questions via Claude Code hooks (primary) with regex fallback, pushes `session:attention` alerts
 - Tracks session status: `idle` → `working` → `waiting` → `done`
+- `POST /api/hooks/event` — localhost-only endpoint that receives Claude Code hook events relayed by `scripts/claude-hook-relay.sh`
 - Git-based updater checks remote for new commits, can pull + restart
 - Hosts the latest APK for OTA updates to phones
 
@@ -64,7 +65,7 @@ The user wants to go for a walk while Claude Code works on their computer. They 
 
 **CLI** (`cli.js` in project root):
 - Headless management tool — everything the admin panel can do
-- Commands: `status`, `token`, `url`, `clients`, `sessions`, `set-password`, `remove-password`, `restart`, `check-update`, `apply-update`, `build-apk`
+- Commands: `setup`, `start`, `status`, `token`, `url`, `clients`, `sessions`, `set-password`, `remove-password`, `restart`, `check-update`, `apply-update`, `build-apk`, `setup-hooks`
 - Reads auth token directly from `data/server-settings.json`
 
 **Networking**:
@@ -86,7 +87,7 @@ Single source of truth for versioning. Contains:
 - `changelog`: array of version entries shown in update banners
 
 ### `cli.js` (project root)
-CLI tool for headless server management. Uses the same REST API as the admin panel. Reads token from `data/server-settings.json`. Commands: status, token, url, clients, sessions, set-password, remove-password, restart, check-update, apply-update, build-apk.
+CLI tool for headless server management. Uses the same REST API as the admin panel. Reads token from `data/server-settings.json`. Commands: setup, start, status, token, url, clients, sessions, set-password, remove-password, restart, check-update, apply-update, build-apk, setup-hooks.
 
 ### `run.sh` (project root)
 Process wrapper script. Modes:
@@ -129,7 +130,8 @@ Versioned settings with migration support and password hashing.
 - `kill(id)` — terminates a session
 - `subscribe(id, ws)` / `unsubscribe(id, ws)` — manage which WebSocket clients receive a session's output
 - `listDirectory(path)` — returns directory contents for the file browser
-- `_detectStatus()` — regex-based heuristic that sets session status based on terminal output patterns
+- `handleHookEvent()` — processes Claude Code hook events (Notification, Stop, UserPromptSubmit) for status detection
+- `_detectStatus()` — regex-based fallback for status detection when hooks are not active (non-Claude sessions)
 - Output buffered per session (last 100KB), sent to new subscribers on connect
 
 ### `server/updater.js`

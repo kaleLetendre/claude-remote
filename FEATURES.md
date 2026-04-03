@@ -8,8 +8,8 @@
 - **System tray icon** — Electron app with green/red status indicator, right-click menu (Open Admin, Copy Token, Copy Phone URL, Restart, Quit)
 - **Auto-start on login** — `./run.sh install` adds to desktop autostart; tray icon appears on boot
 - **Multi-session terminal management** — spawn and manage multiple pty sessions from the server
-- **Question detection** — regex-based detection of when Claude Code asks a question; pushes alerts to connected phones
-- **Session status tracking** — idle / working / waiting / done states detected from terminal output
+- **Question detection** — Claude Code hooks (primary) and regex fallback detect when Claude asks a question; pushes alerts to connected phones
+- **Session status tracking** — idle / working / waiting / done states via Claude Code hooks with regex fallback for non-Claude sessions
 - **Git-based auto-updater** — checks remote for new commits, can pull + restart from the admin panel or phone
 - **Tailscale auto-detection** — server finds its Tailscale IP on startup and prints a ready-to-use URL
 - **CORS support** — allows Capacitor WebView and cross-origin requests from the phone app
