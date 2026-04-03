@@ -32,6 +32,9 @@
       <span id="topbar-status" class="topbar-status"></span>
     </div>
     <div class="topbar-actions">
+      <button id="btn-voice-mode" class="topbar-btn hidden" title="Voice Mode">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/><path d="M19 10v2a7 7 0 01-14 0v-2"/></svg>
+      </button>
       <button id="btn-settings" class="topbar-btn" title="Settings">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
       </button>
@@ -146,6 +149,17 @@
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
       </button>
     </div>
+
+    <!-- Voice Mode Overlay -->
+    <div class="voice-overlay hidden" id="voice-overlay">
+      <div class="voice-controls" id="voice-controls">
+        <canvas class="voice-waveform" id="voice-waveform"></canvas>
+        <button class="voice-talk-btn" id="voice-talk-btn">
+          <div class="voice-talk-ring"></div>
+          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/><path d="M19 10v2a7 7 0 01-14 0v-2"/></svg>
+        </button>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -172,6 +186,13 @@
       <div class="setting-row">
         <div><span class="setting-name">Output Finished</span><br><span class="setting-desc">Notify when Claude finishes working</span></div>
         <div class="toggle-switch on" data-key="alertIdle"></div>
+      </div>
+    </div>
+
+    <div class="setting-group">
+      <div class="setting-row">
+        <div><span class="setting-name">Talk Button: Toggle</span><br><span class="setting-desc">Tap to start/stop instead of hold-to-talk</span></div>
+        <div class="toggle-switch" data-key="voiceTalkToggle"></div>
       </div>
     </div>
 

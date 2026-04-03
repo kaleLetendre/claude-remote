@@ -19,8 +19,11 @@ const state = {
   alertsEnabled: true,
   alertPrompt: true,
   alertIdle: true,
+  voiceTalkToggle: false,
 
   // Runtime
+  voiceMode: false,
+  voiceRecording: false,
   xterm: null,
   fitAddon: null,
 };
@@ -45,7 +48,7 @@ function loadSettings() {
 
 function saveSettings() {
   const keys = [
-    'alertsEnabled', 'alertPrompt', 'alertIdle', 'serverUrl', 'token',
+    'alertsEnabled', 'alertPrompt', 'alertIdle', 'voiceTalkToggle', 'serverUrl', 'token',
   ];
   const obj = {};
   keys.forEach(k => obj[k] = state[k]);
@@ -499,6 +502,7 @@ function updateTopbarStatus() {
 function navigate(view, params = {}) {
   // Cleanup previous view
   if (state.currentView === 'session' && state.activeSessionId) {
+    if (state.voiceRecording) stopVoiceRecording();
     wsSend({ type: 'unsubscribe' });
     destroyTerminal();
   }
@@ -513,6 +517,7 @@ function navigate(view, params = {}) {
   switch (view) {
     case 'dashboard':
       backBtn.classList.add('hidden');
+      $('#btn-voice-mode')?.classList.add('hidden');
       label.textContent = 'Sessions';
       state.activeSessionId = null;
       main.appendChild(cloneTemplate('tpl-dashboard'));
@@ -523,12 +528,14 @@ function navigate(view, params = {}) {
       backBtn.classList.remove('hidden');
       label.textContent = params.name || 'Session';
       state.activeSessionId = params.id;
+      $('#btn-voice-mode')?.classList.remove('hidden');
       main.appendChild(cloneTemplate('tpl-session-view'));
       initSessionView(params.id);
       break;
 
     case 'settings':
       backBtn.classList.remove('hidden');
+      $('#btn-voice-mode')?.classList.add('hidden');
       label.textContent = 'Settings';
       main.appendChild(cloneTemplate('tpl-settings'));
       initSettings();
@@ -972,6 +979,292 @@ function initSessionView(sessionId) {
   // Attention dismiss
   const dismissBtn = $('#attention-dismiss');
   if (dismissBtn) dismissBtn.onclick = dismissAttention;
+
+  // Restore voice mode if it was active
+  if (state.voiceMode) applyVoiceMode(true);
+}
+
+function applyVoiceMode(on) {
+  const quickBar = $('.quick-bar');
+  const inputBar = $('.input-bar');
+  const overlay = $('#voice-overlay');
+  const voiceBtn = $('#btn-voice-mode');
+  const talkBtn = $('#voice-talk-btn');
+
+  if (on) {
+    quickBar?.classList.add('hidden');
+    inputBar?.classList.add('hidden');
+    overlay?.classList.remove('hidden');
+    voiceBtn?.classList.add('active');
+    $('#cmd-input')?.blur();
+
+    // Wire talk button
+    if (talkBtn) {
+      if (state.voiceTalkToggle) {
+        talkBtn.onclick = () => {
+          if (state.voiceRecording) stopVoiceRecording();
+          else startVoiceRecording();
+        };
+        talkBtn.onmousedown = null;
+        talkBtn.onmouseup = null;
+        talkBtn.ontouchstart = null;
+        talkBtn.ontouchend = null;
+      } else {
+        talkBtn.onclick = null;
+        talkBtn.onmousedown = (e) => { e.preventDefault(); startVoiceRecording(); };
+        talkBtn.onmouseup = () => stopVoiceRecording();
+        talkBtn.ontouchstart = (e) => { e.preventDefault(); startVoiceRecording(); };
+        talkBtn.ontouchend = (e) => { e.preventDefault(); stopVoiceRecording(); };
+      }
+    }
+  } else {
+    if (state.voiceRecording) stopVoiceRecording();
+    quickBar?.classList.remove('hidden');
+    inputBar?.classList.remove('hidden');
+    overlay?.classList.add('hidden');
+    voiceBtn?.classList.remove('active');
+
+    // Clear talk button handlers
+    if (talkBtn) {
+      talkBtn.onclick = null;
+      talkBtn.onmousedown = null;
+      talkBtn.onmouseup = null;
+      talkBtn.ontouchstart = null;
+      talkBtn.ontouchend = null;
+    }
+  }
+}
+
+function toggleVoiceMode() {
+  state.voiceMode = !state.voiceMode;
+  applyVoiceMode(state.voiceMode);
+}
+
+// ── Voice Recording (STT + Waveform) ───────────────────────
+
+let _voiceRecog = null;
+let _voiceAnimFrame = null;
+let _voiceStream = null;
+let _voiceAudioCtx = null;
+let _voiceAnalyser = null;
+let _voiceTranscriptParts = [];
+let _voiceCurrentInterim = '';
+let _voicePendingStop = false;
+let _voiceHasFinal = false;
+let _voiceLastActivity = 0;
+let _voiceAudioActive = false;
+
+async function startVoiceRecording() {
+  if (state.voiceRecording) return;
+
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) {
+    const el = $('#voice-you');
+    if (el) el.textContent = 'Speech recognition not supported';
+    return;
+  }
+
+  // Clear previous state
+  _voiceTranscriptParts = [];
+  _voiceCurrentInterim = '';
+  _voicePendingStop = false;
+  _voiceHasFinal = false;
+  const youEl = $('#voice-you');
+  if (youEl) youEl.textContent = '';
+
+  // Speech recognition
+  _voiceRecog = new SR();
+  _voiceRecog.continuous = false;
+  _voiceRecog.interimResults = true;
+  _voiceRecog.lang = 'en-US';
+
+  _voiceRecog.onspeechstart = () => { _voiceAudioActive = true; _voiceLastActivity = Date.now(); };
+  _voiceRecog.onspeechend = () => { _voiceAudioActive = false; };
+
+  _voiceRecog.onresult = (e) => {
+    let final = '';
+    let interim = '';
+    for (let i = 0; i < e.results.length; i++) {
+      if (e.results[i].isFinal) final += e.results[i][0].transcript + ' ';
+      else interim += e.results[i][0].transcript;
+    }
+    if (final) _voiceTranscriptParts.push(final.trim());
+    _voiceCurrentInterim = interim;
+    _voiceHasFinal = !interim;
+    _voiceLastActivity = Date.now();
+
+    if (_voiceHasFinal && _voicePendingStop) {
+      _voicePendingStop = false;
+      finishVoiceRecording();
+    }
+  };
+
+  _voiceRecog.onend = () => {
+    // If waiting for final result, it should have arrived by now — finish up
+    if (_voicePendingStop) {
+      _voicePendingStop = false;
+      finishVoiceRecording();
+      return;
+    }
+    // Keep listening until explicitly stopped (button release or toggle tap)
+    if (state.voiceRecording && _voiceRecog) {
+      try { _voiceRecog.start(); } catch {}
+    }
+  };
+
+  _voiceRecog.onerror = (e) => {
+    if (e.error === 'no-speech' || e.error === 'aborted') return;
+    const el = $('#voice-you');
+    if (el) el.textContent = `Error: ${e.error}`;
+    stopVoiceRecording();
+  };
+
+  try {
+    _voiceRecog.start();
+  } catch (err) {
+    if (youEl) youEl.textContent = `STT error: ${err.message}`;
+    return;
+  }
+
+  state.voiceRecording = true;
+  _voiceLastActivity = 0;
+  _voiceAudioActive = false;
+  $('#voice-talk-btn')?.classList.add('recording');
+
+  // Try to get real audio levels for waveform
+  try {
+    if (navigator.mediaDevices?.getUserMedia) {
+      _voiceStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      _voiceAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const source = _voiceAudioCtx.createMediaStreamSource(_voiceStream);
+      _voiceAnalyser = _voiceAudioCtx.createAnalyser();
+      _voiceAnalyser.fftSize = 64;
+      source.connect(_voiceAnalyser);
+    }
+  } catch {}
+
+  renderWaveform();
+}
+
+function stopVoiceRecording() {
+  if (!state.voiceRecording) return;
+  state.voiceRecording = false;
+  $('#voice-talk-btn')?.classList.remove('recording');
+
+  if (_voiceHasFinal || (!_voiceTranscriptParts.length && !_voiceCurrentInterim)) {
+    // Final result already in, or nothing captured — send immediately
+    finishVoiceRecording();
+  } else {
+    // Still processing interim — wait for final result
+    _voicePendingStop = true;
+    setTimeout(() => {
+      if (_voicePendingStop) {
+        _voicePendingStop = false;
+        finishVoiceRecording();
+      }
+    }, 3000);
+  }
+}
+
+function finishVoiceRecording() {
+  // Stop recognition
+  if (_voiceRecog) {
+    try { _voiceRecog.stop(); } catch {}
+    _voiceRecog = null;
+  }
+
+  // Stop mic/audio
+  if (_voiceStream) {
+    _voiceStream.getTracks().forEach(t => t.stop());
+    _voiceStream = null;
+  }
+  if (_voiceAudioCtx) {
+    _voiceAudioCtx.close().catch(() => {});
+    _voiceAudioCtx = null;
+    _voiceAnalyser = null;
+  }
+
+  // Stop waveform
+  if (_voiceAnimFrame) {
+    cancelAnimationFrame(_voiceAnimFrame);
+    _voiceAnimFrame = null;
+  }
+  clearWaveform();
+
+  // Send transcript to terminal and show it
+  const parts = [..._voiceTranscriptParts];
+  if (_voiceCurrentInterim) parts.push(_voiceCurrentInterim);
+  const text = parts.join(' ').trim();
+  if (text && state.activeSessionId) {
+    wsSend({ type: 'input', sessionId: state.activeSessionId, data: text });
+    setTimeout(() => {
+      wsSend({ type: 'input', sessionId: state.activeSessionId, data: '\r' });
+    }, 150);
+  }
+}
+
+function renderWaveform() {
+  if (!state.voiceRecording) return;
+
+  const canvas = $('#voice-waveform');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const container = $('#voice-controls');
+
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = container.clientWidth * dpr;
+  canvas.height = container.clientHeight * dpr;
+  ctx.scale(dpr, dpr);
+
+  const w = container.clientWidth;
+  const h = container.clientHeight;
+
+  ctx.clearRect(0, 0, w, h);
+
+  const barCount = 32;
+  const barWidth = w / barCount;
+  const gap = 2;
+
+  if (_voiceAnalyser) {
+    // Real audio data
+    const data = new Uint8Array(_voiceAnalyser.frequencyBinCount);
+    _voiceAnalyser.getByteFrequencyData(data);
+    for (let i = 0; i < barCount; i++) {
+      const val = (data[i] || 0) / 255;
+      const barH = Math.max(2, val * h * 0.85);
+      const x = i * barWidth + gap / 2;
+      const y = (h - barH) / 2;
+      ctx.fillStyle = `rgba(160, 128, 240, ${0.15 + val * 0.35})`;
+      ctx.fillRect(x, y, barWidth - gap, barH);
+    }
+  } else {
+    // Fallback — smooth gradient between purple (silent) and green (speaking)
+    const age = Date.now() - _voiceLastActivity;
+    const resultIntensity = age < 300 ? 1.0 : age < 1200 ? (1200 - age) / 900 : 0;
+    const t = _voiceAudioActive ? Math.max(resultIntensity, 0.5) : resultIntensity;
+    // Lerp RGB: purple (160,128,240) → green (80,200,120)
+    const r = Math.round(160 + (80 - 160) * t);
+    const g = Math.round(128 + (200 - 128) * t);
+    const b = Math.round(240 + (120 - 240) * t);
+    const alpha = 0.08 + t * 0.35;
+    for (let i = 0; i < barCount; i++) {
+      const base = t > 0.05 ? t * (0.1 + Math.random() * 0.7) : 0.02 + Math.random() * 0.03;
+      const barH = Math.max(2, base * h * 0.8);
+      const x = i * barWidth + gap / 2;
+      const y = (h - barH) / 2;
+      ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha})`;
+      ctx.fillRect(x, y, barWidth - gap, barH);
+    }
+  }
+
+  _voiceAnimFrame = requestAnimationFrame(renderWaveform);
+}
+
+function clearWaveform() {
+  const canvas = $('#voice-waveform');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
 }
 
 function initTerminal() {
@@ -1521,6 +1814,7 @@ function disconnectServer() {
 // ── Top-level event binding ─────────────────────────────────
 
 $('#btn-back').onclick = () => navigate('dashboard');
+$('#btn-voice-mode').onclick = toggleVoiceMode;
 
 // Android back button — intercept via popstate
 window.addEventListener('popstate', () => {

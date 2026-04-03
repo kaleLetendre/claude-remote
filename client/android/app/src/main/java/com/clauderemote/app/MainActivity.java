@@ -4,6 +4,9 @@ import android.content.Intent;
 import android.os.Build;
 import android.os.Bundle;
 import android.webkit.JavascriptInterface;
+import android.webkit.PermissionRequest;
+import android.webkit.WebChromeClient;
+import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.app.DownloadManager;
 import android.content.Context;
@@ -21,12 +24,28 @@ public class MainActivity extends BridgeActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // Request notification permission on Android 13+
+        // Request permissions on Android 13+
         if (Build.VERSION.SDK_INT >= 33) {
-            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1001);
+            requestPermissions(new String[]{
+                "android.permission.POST_NOTIFICATIONS",
+                "android.permission.RECORD_AUDIO"
+            }, 1001);
+        } else {
+            requestPermissions(new String[]{"android.permission.RECORD_AUDIO"}, 1002);
         }
 
         WebView webView = getBridge().getWebView();
+
+        // Allow getUserMedia on HTTP origins (server runs over Tailscale, not HTTPS)
+        webView.getSettings().setMediaPlaybackRequiresUserGesture(false);
+
+        // Grant mic/audio permission requests from web content
+        webView.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public void onPermissionRequest(PermissionRequest request) {
+                runOnUiThread(() -> request.grant(request.getResources()));
+            }
+        });
 
         // Download listener for APK updates
         webView.setDownloadListener((url, userAgent, contentDisposition, mimetype, contentLength) -> {
