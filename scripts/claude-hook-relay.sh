@@ -15,7 +15,7 @@ for f in "$HOME"/.claude-remote/connection-info.json \
          "$HOME"/claude-remote/data/connection-info.json \
          "$HOME"/claude-remote-prod/data/connection-info.json; do
   [ -f "$f" ] || continue
-  PORT=$(grep -o '"port":[0-9]*' "$f" | head -1 | grep -o '[0-9]*')
+  PORT=$(grep -o '"port":[ ]*[0-9]*' "$f" | head -1 | grep -o '[0-9]*')
   [ -z "$PORT" ] && continue
   curl -s -X POST "http://localhost:$PORT/api/hooks/event" \
     -H "Content-Type: application/json" \
