@@ -21,6 +21,7 @@ const state = {
   alertIdle: true,
   voiceTalkToggle: false,
   voiceAutoAccept: false,
+  voiceSpeechRate: 1.1,
 
   // Runtime
   voiceMode: false,
@@ -49,7 +50,7 @@ function loadSettings() {
 
 function saveSettings() {
   const keys = [
-    'alertsEnabled', 'alertPrompt', 'alertIdle', 'voiceTalkToggle', 'voiceAutoAccept', 'serverUrl', 'token',
+    'alertsEnabled', 'alertPrompt', 'alertIdle', 'voiceTalkToggle', 'voiceAutoAccept', 'voiceSpeechRate', 'serverUrl', 'token',
   ];
   const obj = {};
   keys.forEach(k => obj[k] = state[k]);
@@ -371,6 +372,7 @@ function handleWSMessage(msg) {
       console.log('[ws] output for', msg.sessionId, 'active:', state.activeSessionId, 'match:', msg.sessionId === state.activeSessionId, 'len:', msg.data?.length);
       if (msg.sessionId === state.activeSessionId) {
         appendTerminalOutput(msg.data);
+        if (state.voiceMode) parseVoiceOutput(msg.data);
       }
       break;
 
@@ -1015,6 +1017,22 @@ function initSessionView(sessionId) {
     };
   }
 
+  // Voice speech rate controls
+  const rateLabel = $('#voice-rate-label');
+  if (rateLabel) rateLabel.textContent = (state.voiceSpeechRate || 1.1).toFixed(1) + 'x';
+  const rateDown = $('#voice-rate-down');
+  const rateUp = $('#voice-rate-up');
+  if (rateDown) rateDown.onclick = () => {
+    state.voiceSpeechRate = Math.max(0.5, (state.voiceSpeechRate || 1.1) - 0.1);
+    if (rateLabel) rateLabel.textContent = state.voiceSpeechRate.toFixed(1) + 'x';
+    saveSettings();
+  };
+  if (rateUp) rateUp.onclick = () => {
+    state.voiceSpeechRate = Math.min(3.0, (state.voiceSpeechRate || 1.1) + 0.1);
+    if (rateLabel) rateLabel.textContent = state.voiceSpeechRate.toFixed(1) + 'x';
+    saveSettings();
+  };
+
   // Restore voice mode if it was active
   if (state.voiceMode) applyVoiceMode(true);
 }
@@ -1054,6 +1072,8 @@ function applyVoiceMode(on) {
     }
   } else {
     if (state.voiceRecording) stopVoiceRecording();
+    if ('speechSynthesis' in window) speechSynthesis.cancel();
+    _voiceOutputBuffer = '';
     quickBar?.classList.remove('hidden');
     inputBar?.classList.remove('hidden');
     overlay?.classList.add('hidden');
@@ -1074,6 +1094,12 @@ function applyVoiceMode(on) {
 function toggleVoiceMode() {
   state.voiceMode = !state.voiceMode;
   applyVoiceMode(state.voiceMode);
+  // Warm up speechSynthesis with a silent utterance (Android requires user gesture)
+  if (state.voiceMode && 'speechSynthesis' in window) {
+    const warmup = new SpeechSynthesisUtterance('');
+    warmup.volume = 0;
+    speechSynthesis.speak(warmup);
+  }
 }
 
 // ── Voice Recording (STT + Waveform) ───────────────────────
@@ -1092,6 +1118,8 @@ let _voiceAudioActive = false;
 
 async function startVoiceRecording() {
   if (state.voiceRecording) return;
+  // Interrupt TTS if speaking
+  if ('speechSynthesis' in window) speechSynthesis.cancel();
 
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) {
@@ -1237,7 +1265,7 @@ function finishVoiceRecording() {
 
     // In voice mode, wrap with instruction prefix (skip if answering a prompt)
     const toSend = (state.voiceMode && !isWaiting)
-      ? `[Voice mode. Do your work normally — edit files, run commands, read code. When done, wrap your spoken response in ~VOICE~ markers:\n~VOICE~\nYour concise conversational summary here. This will be read aloud.\n~VOICE~\nEverything outside markers is terminal-only.]\n\n${text}`
+      ? `[Voice mode. Do your work normally — edit files, run commands, etc. After completing your work, put your spoken summary between two lines that each contain only the text tilde-SPEAK-tilde. Keep the summary concise — it will be read aloud via TTS. Everything outside those marker lines stays in the terminal only.]\n\n${text}`
       : text;
 
     wsSend({ type: 'input', sessionId: state.activeSessionId, data: toSend });
@@ -1309,6 +1337,71 @@ function clearWaveform() {
   if (!canvas) return;
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, canvas.width, canvas.height);
+}
+
+// ── Voice Output Parser + TTS ───────────────────────────────
+
+let _voiceOutputBuffer = '';
+
+function parseVoiceOutput(data) {
+  _voiceOutputBuffer += stripAnsi(data);
+
+  // Prevent memory leak
+  if (_voiceOutputBuffer.length > 50000) {
+    _voiceOutputBuffer = _voiceOutputBuffer.slice(-10000);
+  }
+
+  // Look for ~SPEAK~ markers (use regex to handle whitespace variations)
+  const markerRe = /~\s*SPEAK\s*~/g;
+  const matches = [..._voiceOutputBuffer.matchAll(markerRe)];
+  if (matches.length < 2) return;
+
+  // Extract text between first two markers
+  const startIdx = matches[0].index + matches[0][0].length;
+  const endIdx = matches[1].index;
+  const voiceText = _voiceOutputBuffer.slice(startIdx, endIdx).trim();
+  _voiceOutputBuffer = _voiceOutputBuffer.slice(matches[1].index + matches[1][0].length);
+
+  if (voiceText) {
+    console.log('[voice] parsed voice text:', voiceText.slice(0, 100));
+    speakVoice(voiceText);
+  }
+}
+
+function speakVoice(text) {
+  if (!('speechSynthesis' in window)) {
+    console.log('[voice] speechSynthesis not available');
+    return;
+  }
+
+  console.log('[voice] speaking:', text.slice(0, 80));
+
+  // Split into sentences for natural pacing
+  const sentences = text
+    .split(/(?<=[.!?])\s+|\n+/)
+    .map(s => s.trim())
+    .filter(s => s.length > 0);
+
+  if (sentences.length === 0) return;
+
+  speechSynthesis.cancel();
+
+  const last = sentences.length - 1;
+  sentences.forEach((sentence, i) => {
+    const utt = new SpeechSynthesisUtterance(sentence);
+    utt.rate = state.voiceSpeechRate || 1.1;
+    utt.pitch = 1.0;
+    utt.volume = 1.0;
+
+    utt.onerror = (e) => console.log('[voice] TTS error:', e.error);
+
+    // Play chime when all utterances finish
+    if (i === last) {
+      utt.onend = () => playChime('idle');
+    }
+
+    speechSynthesis.speak(utt);
+  });
 }
 
 function initTerminal() {

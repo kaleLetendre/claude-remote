@@ -696,6 +696,33 @@ main#main {
   transition: all 0.15s;
   margin-left: auto;
 }
+.voice-rate {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.voice-rate-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  border: 1px solid var(--border-1);
+  background: var(--bg-2);
+  color: var(--text-2);
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.voice-rate-btn:active { background: var(--bg-3); }
+.voice-rate-label {
+  font-size: 11px;
+  color: var(--text-3);
+  min-width: 28px;
+  text-align: center;
+}
+
 .voice-auto-accept.active {
   color: var(--green);
   border-color: var(--green-border);

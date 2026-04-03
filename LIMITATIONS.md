@@ -1,8 +1,11 @@
 # Known Limitations & Future Additions
 
-## HTTPS / Secure Context
+## HTTPS / Secure Context (Blocks TTS and Real Waveform)
 
-The server runs HTTP only. Android WebView restricts `navigator.mediaDevices.getUserMedia` to secure contexts (HTTPS), so real-time mic audio analysis (waveform visualization) doesn't work. The voice mode waveform uses a fallback driven by speech recognition events, which has ~200ms delay.
+The server runs HTTP only. Android WebView restricts both `speechSynthesis` (text-to-speech) and `navigator.mediaDevices.getUserMedia` (mic audio) to secure contexts (HTTPS). This means:
+- **TTS does not work** — Layer 4 voice output parsing and `~SPEAK~` markers are implemented but speechSynthesis is non-functional on HTTP
+- **Waveform is approximate** — uses speech recognition events (~200ms delay) instead of real audio levels
+- Voice STT (speech-to-text input) works because SpeechRecognition is handled by the Android system, not the WebView
 
 **Fix:** Enable HTTPS using Tailscale's built-in cert provisioning. Run:
 
