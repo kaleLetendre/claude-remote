@@ -415,6 +415,89 @@ async function cmdStart() {
   await new Promise(() => {});
 }
 
+// ── Setup Hooks ───────────────────────────────────────────
+
+async function cmdSetupHooks() {
+  const { writeFileSync, chmodSync } = await import('fs');
+  const { homedir } = await import('os');
+
+  const claudeSettings = join(homedir(), '.claude', 'settings.json');
+  const relayScript = join(PACKAGE_ROOT, 'scripts', 'claude-hook-relay.sh');
+
+  // Ensure relay script is executable
+  try {
+    chmodSync(relayScript, 0o755);
+  } catch (e) {
+    console.error(C.red(`Cannot chmod relay script: ${e.message}`));
+    process.exit(1);
+  }
+
+  // Read existing settings
+  let settings = {};
+  try {
+    settings = JSON.parse(readFileSync(claudeSettings, 'utf8'));
+  } catch {
+    console.log(C.yellow('No existing ~/.claude/settings.json — creating one.'));
+  }
+
+  if (!settings.hooks) settings.hooks = {};
+
+  // Helper: check if relay script is already in a hook array entry's hooks list
+  const hasRelay = (hookEntry) =>
+    hookEntry.hooks?.some(h => h.command?.includes('claude-hook-relay.sh'));
+
+  // Helper: create a relay hook object
+  const relayHook = (hookType) => ({
+    command: `${relayScript} ${hookType}`,
+    type: 'command',
+    timeout: 5,
+  });
+
+  // Add Notification hooks (separate entries per matcher)
+  if (!settings.hooks.Notification) settings.hooks.Notification = [];
+  for (const matcher of ['idle_prompt', 'permission_prompt']) {
+    const existing = settings.hooks.Notification.find(e => e.matcher === matcher);
+    if (existing) {
+      if (!hasRelay(existing)) {
+        existing.hooks.push(relayHook('notification'));
+      }
+    } else {
+      settings.hooks.Notification.push({
+        matcher,
+        hooks: [relayHook('notification')],
+      });
+    }
+  }
+
+  // Add Stop and UserPromptSubmit hooks (append to existing entries)
+  for (const [event, hookType] of [['Stop', 'stop'], ['UserPromptSubmit', 'user_prompt_submit']]) {
+    if (!settings.hooks[event]) settings.hooks[event] = [];
+    if (settings.hooks[event].length === 0) {
+      settings.hooks[event].push({ hooks: [relayHook(hookType)] });
+    } else {
+      // Append to first entry if not already present
+      const first = settings.hooks[event][0];
+      if (!hasRelay(first)) {
+        first.hooks.push(relayHook(hookType));
+      }
+    }
+  }
+
+  writeFileSync(claudeSettings, JSON.stringify(settings, null, 2) + '\n');
+
+  console.log(C.green('Claude Code hooks configured.'));
+  console.log(`  Settings: ${C.dim(claudeSettings)}`);
+  console.log(`  Relay:    ${C.dim(relayScript)}`);
+  console.log();
+  console.log('Hooks added:');
+  console.log(`  ${C.dim('Notification (idle_prompt)')}`);
+  console.log(`  ${C.dim('Notification (permission_prompt)')}`);
+  console.log(`  ${C.dim('Stop')}`);
+  console.log(`  ${C.dim('UserPromptSubmit')}`);
+  console.log();
+  console.log(`Existing hooks preserved. Run again safely — it's idempotent.`);
+}
+
 // ── CLI router ──────────────────────────────────────────────
 
 const [cmd, ...args] = process.argv.slice(2);
@@ -433,6 +516,7 @@ const commands = {
   'check-update':   { fn: cmdCheckUpdate,    desc: 'Check for updates' },
   'apply-update':   { fn: cmdApplyUpdate,    desc: 'Apply available update' },
   'build-apk':      { fn: cmdBuildApk,       desc: 'Build Android APK' },
+  'setup-hooks':    { fn: cmdSetupHooks,    desc: 'Configure Claude Code hooks for notifications' },
 };
 
 if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {

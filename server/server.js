@@ -68,6 +68,17 @@ function authCheck(req, res, next) {
   next();
 }
 
+// ── Hook events from Claude Code (localhost only, no auth) ─────────────
+app.post('/api/hooks/event', (req, res) => {
+  const ip = req.socket.remoteAddress;
+  if (ip !== '127.0.0.1' && ip !== '::1' && ip !== '::ffff:127.0.0.1') {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  const { hookType, sessionId, data } = req.body;
+  sessions.handleHookEvent(hookType, sessionId, data);
+  res.json({ ok: true });
+});
+
 // ── Auth endpoints (no authCheck — these exchange password for token) ──
 
 app.post('/api/auth/login', (req, res) => {

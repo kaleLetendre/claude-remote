@@ -102,7 +102,7 @@ export class SessionManager extends EventEmitter {
     if (!session) throw new Error('Session not found');
     if (session.pty) throw new Error('Session is already alive');
 
-    const ptyEnv = { ...process.env, TERM: 'xterm-256color' };
+    const ptyEnv = { ...process.env, TERM: 'xterm-256color', CLAUDE_REMOTE_SESSION_ID: id };
     delete ptyEnv.npm_config_prefix;
     delete ptyEnv.npm_config_local_prefix;
 
@@ -138,7 +138,7 @@ export class SessionManager extends EventEmitter {
     }
 
     // Clean env for pty — remove npm_config_prefix which breaks NVM
-    const ptyEnv = { ...process.env, TERM: 'xterm-256color' };
+    const ptyEnv = { ...process.env, TERM: 'xterm-256color', CLAUDE_REMOTE_SESSION_ID: id };
     delete ptyEnv.npm_config_prefix;
     delete ptyEnv.npm_config_local_prefix;
 
@@ -210,6 +210,13 @@ export class SessionManager extends EventEmitter {
   _detectStatus(session, cleanText) {
     if (cleanText.trim().length === 0) return;
 
+    // If hooks are actively providing status, skip regex detection.
+    // Fall back to regex if no hook event in 5 minutes.
+    if (session._hookActive) {
+      if (Date.now() - session._lastHookEvent < 300_000) return;
+      session._hookActive = false;
+    }
+
     // Detect Claude Code presence in this session
     if (!session._claudeActive) {
       for (const pat of CLAUDE_PRESENCE_PATTERNS) {
@@ -280,6 +287,58 @@ export class SessionManager extends EventEmitter {
         this.emit('session:attention', session.id, 'idle', null);
       }
     }, 2000);
+  }
+
+  // ── Hook-based status detection (from Claude Code hooks) ──────────
+  handleHookEvent(hookType, sessionId, hookData) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return; // Not our session (different instance)
+
+    session._hookActive = true;
+    session._lastHookEvent = Date.now();
+    session._claudeActive = true;
+
+    switch (hookType) {
+      case 'notification': {
+        const notifType = hookData?.notification_type;
+        if (notifType === 'permission_prompt' || notifType === 'idle_prompt') {
+          if (notifType === 'permission_prompt') {
+            const prev = session.status;
+            session.status = 'waiting';
+            session.attentionPreview = hookData.message || 'Claude needs permission';
+            if (session._idleTimer) clearTimeout(session._idleTimer);
+            const now = Date.now();
+            if (prev !== 'waiting' && (!session._lastAttention || now - session._lastAttention > 10000)) {
+              session._lastAttention = now;
+              session._attentionReason = 'prompt';
+              this.emit('session:attention', session.id, 'prompt', session.attentionPreview);
+            }
+          } else {
+            // idle_prompt — Claude returned to idle
+            const wasWorking = session.status === 'working';
+            session.status = 'idle';
+            if (wasWorking) {
+              const now = Date.now();
+              if (!session._lastAttention || now - session._lastAttention > 10000) {
+                session._lastAttention = now;
+                session._attentionReason = 'idle';
+                this.emit('session:attention', session.id, 'idle', null);
+              }
+            }
+          }
+        }
+        break;
+      }
+      case 'stop':
+        // Claude finished responding — idle_prompt notification usually follows shortly
+        session.status = 'idle';
+        break;
+      case 'user_prompt_submit':
+        session.status = 'working';
+        session.attentionPreview = null;
+        session._attentionReason = null;
+        break;
+    }
   }
 
   write(id, data) {
