@@ -665,6 +665,43 @@ main#main {
   gap: 16px;
 }
 
+.voice-nav {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  width: 100%;
+}
+.voice-nav-btn {
+  padding: 10px 20px;
+  border-radius: 8px;
+  border: 1.5px solid var(--border-1);
+  background: var(--bg-2);
+  color: var(--text-1);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.voice-nav-btn:active { transform: scale(0.95); background: var(--bg-3); }
+
+.voice-auto-accept {
+  padding: 10px 16px;
+  border-radius: 8px;
+  border: 1.5px solid var(--border-1);
+  background: var(--bg-2);
+  color: var(--text-3);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+  margin-left: auto;
+}
+.voice-auto-accept.active {
+  color: var(--green);
+  border-color: var(--green-border);
+  background: var(--green-bg);
+}
+
 .voice-controls {
   position: relative;
   width: 100%;

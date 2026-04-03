@@ -20,6 +20,7 @@ const state = {
   alertPrompt: true,
   alertIdle: true,
   voiceTalkToggle: false,
+  voiceAutoAccept: false,
 
   // Runtime
   voiceMode: false,
@@ -48,7 +49,7 @@ function loadSettings() {
 
 function saveSettings() {
   const keys = [
-    'alertsEnabled', 'alertPrompt', 'alertIdle', 'voiceTalkToggle', 'serverUrl', 'token',
+    'alertsEnabled', 'alertPrompt', 'alertIdle', 'voiceTalkToggle', 'voiceAutoAccept', 'serverUrl', 'token',
   ];
   const obj = {};
   keys.forEach(k => obj[k] = state[k]);
@@ -373,9 +374,18 @@ function handleWSMessage(msg) {
       }
       break;
 
-    case 'session:attention':
-      handleAttention(msg.sessionId, msg.reason, msg.preview);
+    case 'session:attention': {
+      // Update session status immediately
+      const s = state.sessions.find(s => s.id === msg.sessionId);
+      if (s) s.status = msg.reason === 'prompt' ? 'waiting' : 'idle';
+      // Auto-accept: send Enter immediately when prompt appears
+      if (msg.reason === 'prompt' && state.voiceAutoAccept) {
+        wsSend({ type: 'input', sessionId: msg.sessionId, data: '\r' });
+      } else {
+        handleAttention(msg.sessionId, msg.reason, msg.preview);
+      }
       break;
+    }
 
     case 'session:exit':
     case 'session:killed':
@@ -518,6 +528,7 @@ function navigate(view, params = {}) {
     case 'dashboard':
       backBtn.classList.add('hidden');
       $('#btn-voice-mode')?.classList.add('hidden');
+      $('#btn-auto-accept')?.classList.add('hidden');
       label.textContent = 'Sessions';
       state.activeSessionId = null;
       main.appendChild(cloneTemplate('tpl-dashboard'));
@@ -529,6 +540,8 @@ function navigate(view, params = {}) {
       label.textContent = params.name || 'Session';
       state.activeSessionId = params.id;
       $('#btn-voice-mode')?.classList.remove('hidden');
+      $('#btn-auto-accept')?.classList.remove('hidden');
+      if (state.voiceAutoAccept) $('#btn-auto-accept')?.classList.add('active');
       main.appendChild(cloneTemplate('tpl-session-view'));
       initSessionView(params.id);
       break;
@@ -536,6 +549,7 @@ function navigate(view, params = {}) {
     case 'settings':
       backBtn.classList.remove('hidden');
       $('#btn-voice-mode')?.classList.add('hidden');
+      $('#btn-auto-accept')?.classList.add('hidden');
       label.textContent = 'Settings';
       main.appendChild(cloneTemplate('tpl-settings'));
       initSettings();
@@ -980,6 +994,27 @@ function initSessionView(sessionId) {
   const dismissBtn = $('#attention-dismiss');
   if (dismissBtn) dismissBtn.onclick = dismissAttention;
 
+  // Voice nav buttons — send command to terminal
+  $$('.voice-nav-btn').forEach(btn => {
+    btn.onclick = () => {
+      const cmd = btn.dataset.cmd;
+      if (cmd && state.activeSessionId) {
+        wsSend({ type: 'input', sessionId: state.activeSessionId, data: cmd });
+      }
+    };
+  });
+
+  // Auto-accept toggle
+  const autoBtn = $('#voice-auto-accept');
+  if (autoBtn) {
+    if (state.voiceAutoAccept) autoBtn.classList.add('active');
+    autoBtn.onclick = () => {
+      state.voiceAutoAccept = !state.voiceAutoAccept;
+      autoBtn.classList.toggle('active', state.voiceAutoAccept);
+      saveSettings();
+    };
+  }
+
   // Restore voice mode if it was active
   if (state.voiceMode) applyVoiceMode(true);
 }
@@ -1034,6 +1069,7 @@ function applyVoiceMode(on) {
     }
   }
 }
+
 
 function toggleVoiceMode() {
   state.voiceMode = !state.voiceMode;
@@ -1191,12 +1227,20 @@ function finishVoiceRecording() {
   }
   clearWaveform();
 
-  // Send transcript to terminal and show it
+  // Send transcript to terminal
   const parts = [..._voiceTranscriptParts];
   if (_voiceCurrentInterim) parts.push(_voiceCurrentInterim);
   const text = parts.join(' ').trim();
   if (text && state.activeSessionId) {
-    wsSend({ type: 'input', sessionId: state.activeSessionId, data: text });
+    const session = state.sessions.find(s => s.id === state.activeSessionId);
+    const isWaiting = session?.status === 'waiting';
+
+    // In voice mode, wrap with instruction prefix (skip if answering a prompt)
+    const toSend = (state.voiceMode && !isWaiting)
+      ? `[Voice mode. Do your work normally — edit files, run commands, read code. When done, wrap your spoken response in ~VOICE~ markers:\n~VOICE~\nYour concise conversational summary here. This will be read aloud.\n~VOICE~\nEverything outside markers is terminal-only.]\n\n${text}`
+      : text;
+
+    wsSend({ type: 'input', sessionId: state.activeSessionId, data: toSend });
     setTimeout(() => {
       wsSend({ type: 'input', sessionId: state.activeSessionId, data: '\r' });
     }, 150);
@@ -1815,6 +1859,12 @@ function disconnectServer() {
 
 $('#btn-back').onclick = () => navigate('dashboard');
 $('#btn-voice-mode').onclick = toggleVoiceMode;
+$('#btn-auto-accept').onclick = () => {
+  state.voiceAutoAccept = !state.voiceAutoAccept;
+  $('#btn-auto-accept')?.classList.toggle('active', state.voiceAutoAccept);
+  $('#voice-auto-accept')?.classList.toggle('active', state.voiceAutoAccept);
+  saveSettings();
+};
 
 // Android back button — intercept via popstate
 window.addEventListener('popstate', () => {

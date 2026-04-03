@@ -32,6 +32,9 @@
       <span id="topbar-status" class="topbar-status"></span>
     </div>
     <div class="topbar-actions">
+      <button id="btn-auto-accept" class="topbar-btn hidden" title="Auto-accept prompts">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+      </button>
       <button id="btn-voice-mode" class="topbar-btn hidden" title="Voice Mode">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/><path d="M19 10v2a7 7 0 01-14 0v-2"/></svg>
       </button>
@@ -152,6 +155,12 @@
 
     <!-- Voice Mode Overlay -->
     <div class="voice-overlay hidden" id="voice-overlay">
+      <div class="voice-nav">
+        <button class="voice-nav-btn" data-cmd="&#27;[A">&#9650;</button>
+        <button class="voice-nav-btn" data-cmd="&#13;">&#9654; Enter</button>
+        <button class="voice-nav-btn" data-cmd="&#27;[B">&#9660;</button>
+        <button class="voice-auto-accept" id="voice-auto-accept" title="Auto-accept prompts">Auto</button>
+      </div>
       <div class="voice-controls" id="voice-controls">
         <canvas class="voice-waveform" id="voice-waveform"></canvas>
         <button class="voice-talk-btn" id="voice-talk-btn">
