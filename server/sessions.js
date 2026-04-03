@@ -6,38 +6,6 @@ import { getSessionsPath, ensureDataDir } from '../lib/paths.js';
 
 const SESSIONS_FILE = getSessionsPath();
 
-// ── Claude Code detection ───────────────────────────────────────────
-// Patterns that indicate Claude Code is the active process in this session.
-// Use \s* between words because terminal rendering can collapse/strip spaces.
-const CLAUDE_PRESENCE_PATTERNS = [
-  /\?\s*for\s*shortcuts/,        // Claude Code's idle prompt
-  /\(Y\)es\s*\/\s*\(N\)o/,      // Tool approval dialog
-  /esc\s*to\s*interrupt/,        // Claude Code working status bar
-  /plan\s*mode\s*on/,            // Plan mode active
-];
-
-// Patterns that mean Claude Code is waiting for user input (blocked).
-const CLAUDE_INPUT_PATTERNS = [
-  /\(Y\)es\s*\/\s*\(N\)o/,      // Tool approval (parenthesized)
-  /Yes\s*\/\s*No/,               // Simpler Yes / No with slash
-  /Yes\s+No\s+Always/,           // Claude Code button-style tool approval (Yes  No  Always  Deny always)
-  /Yes\s+No\s+Deny/,             // Variant without Always
-  /\(y\/n\)/i, /\[Y\/n\]/i, /\[y\/N\]/i,
-  /\(yes\/no\)/i,
-  /press enter to continue/i,
-  /Do you want to proceed/i,
-  /approve the plan/i,           // Plan mode approval prompt
-  /auto.accept/i,                // Auto-accept edits prompt
-  /Enter\s*to\s*select.*to\s*navigate/,  // Claude Code menu selection (plan mode, etc.)
-  /Allow\s+\w+.*\?/,             // "Allow Edit to file.js?" style prompts
-];
-
-// Patterns that mean Claude Code finished and returned to its idle prompt.
-const CLAUDE_IDLE_PATTERNS = [
-  /\?\s*for\s*shortcuts/,        // Claude's main idle prompt (normal mode)
-  /shift\+tab\s*to\s*cycle/,     // Plan mode idle prompt
-];
-
 export class SessionManager extends EventEmitter {
   constructor({ port = 3033 } = {}) {
     super();
@@ -186,9 +154,6 @@ export class SessionManager extends EventEmitter {
         session.outputBuffer = session.outputBuffer.slice(-60_000);
       }
 
-      const clean = stripAnsi(data);
-      this._detectStatus(session, clean);
-
       const msg = JSON.stringify({ type: 'output', sessionId: id, data });
       for (const ws of session.subscribers) {
         if (ws.readyState === 1) ws.send(msg);
@@ -208,97 +173,13 @@ export class SessionManager extends EventEmitter {
     });
   }
 
-  _detectStatus(session, cleanText) {
-    if (cleanText.trim().length === 0) return;
-
-    // If hooks are actively providing status, skip regex detection.
-    // Fall back to regex if no hook event in 5 minutes.
-    if (session._hookActive) {
-      if (Date.now() - session._lastHookEvent < 300_000) return;
-      session._hookActive = false;
-    }
-
-    // Detect Claude Code presence in this session
-    if (!session._claudeActive) {
-      for (const pat of CLAUDE_PRESENCE_PATTERNS) {
-        if (pat.test(cleanText)) {
-          session._claudeActive = true;
-          break;
-        }
-      }
-    }
-
-    // Check the tail of the buffer for known patterns
-    const tail = stripAnsi(session.outputBuffer.slice(-600)).replace(/\r+/g, '\n');
-    const lastLines = tail.split('\n').filter(l => l.trim()).slice(-8).join('\n');
-
-    // 1. Check for Claude waiting for input (tool approval, y/n, etc.)
-    for (const pat of CLAUDE_INPUT_PATTERNS) {
-      if (pat.test(lastLines)) {
-        const prev = session.status;
-        session.status = 'waiting';
-        // Find a meaningful preview line — skip UI chrome like "cancel", "navigate", etc.
-        const previewLines = lastLines.trim().split('\n').filter(l =>
-          l.trim() && !/^(cancel|Enter\s*to\s*select|to\s*navigate|Esc\s*to)/.test(l.trim())
-        );
-        session.attentionPreview = previewLines.pop() || 'Claude has a question';
-        if (session._idleTimer) clearTimeout(session._idleTimer);
-
-        const now = Date.now();
-        if (prev !== 'waiting' && (!session._lastAttention || now - session._lastAttention > 10000)) {
-          session._lastAttention = now;
-          session._attentionReason = 'prompt';
-          this.emit('session:attention', session.id, 'prompt', session.attentionPreview);
-        }
-        return;
-      }
-    }
-
-    // 2. Check if Claude returned to its idle prompt (finished working)
-    if (session._claudeActive) {
-      for (const pat of CLAUDE_IDLE_PATTERNS) {
-        if (pat.test(lastLines)) {
-          // Set idle immediately — don't let subsequent ANSI repaints reset to working
-          const wasWorking = session.status === 'working';
-          session.status = 'idle';
-          if (wasWorking) {
-            this._scheduleIdleNotification(session);
-          }
-          return;
-        }
-      }
-    }
-
-    // 3. If none of the above matched, session is actively producing output
-    // But don't override idle — only ANSI repaints arrive after idle prompt
-    if (session.status !== 'idle' && session.status !== 'waiting') {
-      session.status = 'working';
-    }
-    if (session._idleTimer) clearTimeout(session._idleTimer);
-  }
-
-  // Notify after Claude's idle prompt settles (debounce to avoid false triggers during streaming)
-  _scheduleIdleNotification(session) {
-    if (session._idleTimer) clearTimeout(session._idleTimer);
-    session._idleTimer = setTimeout(() => {
-      const now = Date.now();
-      if (!session._lastAttention || now - session._lastAttention > 10000) {
-        session._lastAttention = now;
-        session._attentionReason = 'idle';
-        this.emit('session:attention', session.id, 'idle', null);
-      }
-    }, 2000);
-  }
-
   // ── Hook-based status detection (from Claude Code hooks) ──────────
   handleHookEvent(hookType, sessionId, hookData) {
     console.log(`[hook] type=${hookType} session=${sessionId} data=${JSON.stringify(hookData)?.slice(0, 200)}`);
     const session = this.sessions.get(sessionId);
     if (!session) { console.log(`[hook] session not found: ${sessionId}`); return; }
 
-    session._hookActive = true;
-    session._lastHookEvent = Date.now();
-    session._claudeActive = true;
+    session.lastActivity = Date.now();
 
     switch (hookType) {
       case 'notification': {
@@ -308,7 +189,6 @@ export class SessionManager extends EventEmitter {
             const prev = session.status;
             session.status = 'waiting';
             session.attentionPreview = hookData.message || 'Claude needs permission';
-            if (session._idleTimer) clearTimeout(session._idleTimer);
             const now = Date.now();
             if (prev !== 'waiting' && (!session._lastAttention || now - session._lastAttention > 10000)) {
               session._lastAttention = now;
@@ -470,11 +350,3 @@ export class SessionManager extends EventEmitter {
   }
 }
 
-function stripAnsi(str) {
-  return str
-    .replace(/\x1b\[[\x20-\x3f]*[\x40-\x7e]/g, '')  // All CSI sequences
-    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')  // OSC sequences
-    .replace(/\x1b[()][AB012]/g, '')             // Character set selection
-    .replace(/\x1b[\x20-\x2f]*[\x30-\x7e]/g, '') // Other escape sequences
-    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');  // Control characters
-}
