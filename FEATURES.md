@@ -14,7 +14,7 @@
 - **Tailscale auto-detection** — server finds its Tailscale IP on startup and prints a ready-to-use URL
 - **CORS support** — allows Capacitor WebView and cross-origin requests from the phone app
 - **Crash recovery** — `run.sh` restart loop catches crashes and restarts the server automatically
-- **CLI tool** — `node cli.js <command>` for headless server management; covers everything the admin panel does (status, token, url, clients, sessions, set-password, remove-password, restart, check-update, apply-update, build-apk)
+- **CLI tool** — `./cli.js <command>` for headless server management; covers everything the admin panel does (setup, start, status, token, url, clients, sessions, set-password, remove-password, restart, check-update, apply-update, build-apk)
 - **APK hosting** — server hosts the latest APK at `/api/app/download`; phones can download updates over Tailscale/WAN
 
 ## Mobile Side (Android App)
@@ -49,14 +49,11 @@ When Capacitor plugins change or the bootstrap screen itself needs updating, a n
 3. Next time a phone connects, it sees the update prompt and downloads the new APK
 4. Server code updates: `node cli.js apply-update` or use the admin panel/phone to pull + restart
 
-## Lifeline Fallback System
+## Safety / Multi-Instance
 
-A separate, frozen emergency system that is never modified by updates. If a bad update breaks the main app, the lifeline keeps you connected.
+The recommended setup runs two instances side by side:
 
-- **Lifeline server** — standalone Node.js process on port 3034, zero imports from main server code, own `node_modules/`
-- **Lifeline client** — single HTML file with inline CSS/JS, plain text terminal (no xterm.js, no CDN dependencies)
-- **Lifeline APK** — separate Android app (`CR Lifeline`) that installs alongside the main app, never updated
-- **Shared auth** — reads password/token from the same `data/server-settings.json`
-- **Independent sessions** — own PTY sessions, separate from main server
-- **Always running** — started by `run.sh` and Electron alongside the main server, survives main server crashes
-- **Browser accessible** — open `http://server-ip:3034` from any browser as a fallback
+- **Prod** (port 3033, `main` branch) — stable version, always running
+- **Dev** (port 3034, `dev` branch) — active development
+
+If a bad dev change breaks the app, prod keeps you connected remotely. The `./cli.js build-apk --dev` command builds a separate APK (`com.clauderemote.dev` / "CR Dev") that installs alongside the prod app.

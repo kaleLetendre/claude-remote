@@ -18,13 +18,18 @@ const CLAUDE_PRESENCE_PATTERNS = [
 
 // Patterns that mean Claude Code is waiting for user input (blocked).
 const CLAUDE_INPUT_PATTERNS = [
-  /\(Y\)es\s*\/\s*\(N\)o/,      // Tool approval
-  /Yes\s*\/\s*No/,               // Simpler Yes / No variant
+  /\(Y\)es\s*\/\s*\(N\)o/,      // Tool approval (parenthesized)
+  /Yes\s*\/\s*No/,               // Simpler Yes / No with slash
+  /Yes\s+No\s+Always/,           // Claude Code button-style tool approval (Yes  No  Always  Deny always)
+  /Yes\s+No\s+Deny/,             // Variant without Always
   /\(y\/n\)/i, /\[Y\/n\]/i, /\[y\/N\]/i,
   /\(yes\/no\)/i,
   /press enter to continue/i,
   /Do you want to proceed/i,
+  /approve the plan/i,           // Plan mode approval prompt
+  /auto.accept/i,                // Auto-accept edits prompt
   /Enter\s*to\s*select.*to\s*navigate/,  // Claude Code menu selection (plan mode, etc.)
+  /Allow\s+\w+.*\?/,             // "Allow Edit to file.js?" style prompts
 ];
 
 // Patterns that mean Claude Code finished and returned to its idle prompt.
@@ -245,8 +250,10 @@ export class SessionManager extends EventEmitter {
     if (session._claudeActive) {
       for (const pat of CLAUDE_IDLE_PATTERNS) {
         if (pat.test(lastLines)) {
-          // Claude's idle prompt appeared — schedule notification after debounce
-          if (session.status === 'working') {
+          // Set idle immediately — don't let subsequent ANSI repaints reset to working
+          const wasWorking = session.status === 'working';
+          session.status = 'idle';
+          if (wasWorking) {
             this._scheduleIdleNotification(session);
           }
           return;
@@ -255,7 +262,10 @@ export class SessionManager extends EventEmitter {
     }
 
     // 3. If none of the above matched, session is actively producing output
-    session.status = 'working';
+    // But don't override idle — only ANSI repaints arrive after idle prompt
+    if (session.status !== 'idle' && session.status !== 'waiting') {
+      session.status = 'working';
+    }
     if (session._idleTimer) clearTimeout(session._idleTimer);
   }
 
@@ -263,8 +273,6 @@ export class SessionManager extends EventEmitter {
   _scheduleIdleNotification(session) {
     if (session._idleTimer) clearTimeout(session._idleTimer);
     session._idleTimer = setTimeout(() => {
-      if (session.status !== 'working') return;
-      session.status = 'idle';
       const now = Date.now();
       if (!session._lastAttention || now - session._lastAttention > 10000) {
         session._lastAttention = now;

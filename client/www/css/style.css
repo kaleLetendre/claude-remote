@@ -193,6 +193,7 @@ main#main {
 .session-card[data-status="idle"]::before { background: var(--blue); }
 .session-card[data-status="done"]::before { background: var(--text-3); }
 .session-card[data-status="dead"]::before { background: var(--red); }
+.session-card[data-status="offline"]::before { background: var(--text-3); }
 
 .card-header {
   display: flex;
@@ -211,6 +212,7 @@ main#main {
 .card-status-dot.waiting { background: var(--amber); animation: blink 1.5s infinite; }
 .card-status-dot.done { background: var(--text-3); }
 .card-status-dot.dead { background: var(--red); }
+.card-status-dot.offline { background: var(--text-3); opacity: 0.5; }
 
 .card-name {
   font-weight: 600;
@@ -235,6 +237,7 @@ main#main {
 .card-status-label.waiting { color: var(--amber); background: var(--amber-bg); }
 .card-status-label.done { color: var(--text-3); background: var(--bg-3); }
 .card-status-label.dead { color: var(--red); background: var(--red-bg); }
+.card-status-label.offline { color: var(--text-3); background: var(--bg-3); }
 
 .card-cwd {
   font-family: var(--font-mono);
@@ -451,6 +454,45 @@ main#main {
 .dir-item-icon { font-size: 14px; flex-shrink: 0; width: 20px; text-align: center; }
 .dir-item-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dir-item-size { font-size: 11px; color: var(--text-3); }
+
+/* ── Session Tree ─────────────────────────────────── */
+.tree-group { margin-bottom: 2px; }
+
+.tree-dir-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text-1);
+  cursor: pointer;
+  border-radius: 6px;
+  user-select: none;
+}
+.tree-dir-header:active { background: var(--bg-2); }
+
+.tree-toggle {
+  font-size: 10px;
+  width: 14px;
+  flex-shrink: 0;
+  color: var(--text-3);
+}
+
+.tree-count {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-left: auto;
+}
+
+.tree-dir-content {
+  margin-left: 18px;
+  padding-left: 6px;
+  border-left: 1px solid var(--border-0);
+}
+.tree-dir-content.collapsed { display: none; }
+
+.tree-dir-content > .session-card { margin-left: 4px; }
 
 .dialog-actions {
   display: flex; gap: 10px;

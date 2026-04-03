@@ -153,6 +153,97 @@ function shortenPath(p) {
   return p;
 }
 
+// ── Session Tree ────────────────────────────────────────────
+
+const collapseState = JSON.parse(localStorage.getItem('claude-remote-tree-state') || '{}');
+
+function saveCollapseState() {
+  localStorage.setItem('claude-remote-tree-state', JSON.stringify(collapseState));
+}
+
+function countSessions(node) {
+  let n = node.sessions.length;
+  for (const c of node.children) n += countSessions(c);
+  return n;
+}
+
+function buildSessionTree(sessions) {
+  // Build trie from shortened cwds
+  const root = { name: '', children: {}, sessions: [] };
+  for (const s of sessions) {
+    const p = shortenPath(s.cwd);
+    const parts = p.split('/').filter(Boolean);
+    let node = root;
+    for (const part of parts) {
+      if (!node.children[part]) node.children[part] = { name: part, children: {}, sessions: [] };
+      node = node.children[part];
+    }
+    node.sessions.push(s);
+  }
+
+  // Convert trie to array, collapsing single-child nodes
+  function collapse(node, prefix, parentPath) {
+    const childKeys = Object.keys(node.children);
+    // Single child + no sessions at this level → merge with child
+    if (childKeys.length === 1 && node.sessions.length === 0) {
+      const only = node.children[childKeys[0]];
+      const base = prefix || node.name;
+      const merged = base ? base + '/' + only.name : only.name;
+      return collapse(only, merged, parentPath);
+    }
+    const label = prefix || node.name;
+    const fullPath = parentPath ? parentPath + '/' + label : label;
+    const children = childKeys
+      .sort()
+      .map(k => collapse(node.children[k], '', fullPath))
+      .flat();
+    if (label) {
+      return [{ label, path: fullPath, sessions: node.sessions, children }];
+    }
+    return children;
+  }
+
+  let tree = collapse(root, '', '');
+
+  // Strip redundant single root with no sessions
+  while (tree.length === 1 && tree[0].sessions.length === 0 && tree[0].children.length > 0) {
+    tree = tree[0].children;
+  }
+
+  return tree;
+}
+
+// ── Session Cache (persists across server restarts) ─────────
+
+function sessionCacheKey() {
+  const url = state.serverUrl || location.origin;
+  return 'claude-remote-sessions-' + url;
+}
+
+function loadCachedSessions() {
+  try {
+    return JSON.parse(localStorage.getItem(sessionCacheKey()) || '[]');
+  } catch { return []; }
+}
+
+function saveCachedSessions(sessions) {
+  const meta = sessions.map(s => ({
+    id: s.id, name: s.name, cwd: s.cwd,
+    createdAt: s.createdAt, lastActivity: s.lastActivity,
+  }));
+  localStorage.setItem(sessionCacheKey(), JSON.stringify(meta));
+}
+
+function mergeWithCache(serverSessions) {
+  // Server is authoritative for any session it knows about.
+  // Cached sessions not on the server are shown as 'offline'.
+  const serverIds = new Set(serverSessions.map(s => s.id));
+  const cached = loadCachedSessions().filter(s => !serverIds.has(s.id));
+  const offline = cached.map(s => ({ ...s, status: 'offline' }));
+  saveCachedSessions(serverSessions);
+  return [...serverSessions, ...offline];
+}
+
 // ── API Layer ───────────────────────────────────────────────
 
 const api = {
@@ -277,7 +368,7 @@ function wsSend(msg) {
 function handleWSMessage(msg) {
   switch (msg.type) {
     case 'sessions':
-      state.sessions = msg.data;
+      state.sessions = mergeWithCache(msg.data);
       if (state.currentView === 'dashboard') renderDashboard();
       updateTopbarStatus();
       break;
@@ -540,6 +631,12 @@ function navigate(view, params = {}) {
 // ── Dashboard View ──────────────────────────────────────────
 
 function initDashboard() {
+  // Show cached sessions immediately while waiting for server
+  if (state.sessions.length === 0) {
+    const cached = loadCachedSessions();
+    if (cached.length) state.sessions = cached.map(s => ({ ...s, status: 'offline' }));
+  }
+
   renderDashboard();
   updateConnectionUI();
 
@@ -548,6 +645,133 @@ function initDashboard() {
 
   // Request fresh list
   wsSend({ type: 'list' });
+}
+
+function renderSessionCard(s) {
+  const card = cloneTemplate('tpl-session-card');
+  card.dataset.id = s.id;
+  card.dataset.status = s.status;
+
+  $('.card-name', card).textContent = s.name;
+  $('.card-cwd', card).textContent = shortenPath(s.cwd);
+
+  const dot = $('.card-status-dot', card);
+  dot.classList.add(s.status);
+
+  const label = $('.card-status-label', card);
+  label.textContent = s.status;
+  label.classList.add(s.status);
+
+  if (s.attentionPreview) {
+    $('.card-preview', card).textContent = s.attentionPreview;
+  }
+
+  $('.card-time', card).textContent = timeAgo(s.lastActivity);
+
+  if (s.status === 'offline') {
+    // Offline sessions are cached locally — create a new session in the same dir
+    const relaunch = async () => {
+      try {
+        const session = await api.post('/api/sessions', { name: s.name, cwd: s.cwd });
+        navigate('session', { id: session.id, name: session.name });
+      } catch (err) {
+        console.error('Relaunch failed:', err);
+      }
+    };
+    card.onclick = (e) => {
+      if (e.target.closest('.card-btn')) return;
+      relaunch();
+    };
+    $('.card-btn-open', card).textContent = 'Relaunch';
+    $('.card-btn-open', card).onclick = relaunch;
+    $('.card-btn-kill', card).textContent = 'Dismiss';
+    $('.card-btn-kill', card).onclick = (e) => {
+      e.stopPropagation();
+      // Remove from local cache
+      const cached = loadCachedSessions().filter(c => c.id !== s.id);
+      localStorage.setItem(sessionCacheKey(), JSON.stringify(cached));
+      state.sessions = state.sessions.filter(x => x.id !== s.id);
+      renderDashboard();
+    };
+  } else if (s.status === 'dead') {
+    const openSession = async () => {
+      try {
+        await api.post(`/api/sessions/${s.id}/reconnect`);
+        navigate('session', { id: s.id, name: s.name });
+      } catch (err) {
+        console.error('Reconnect failed:', err);
+      }
+    };
+    card.onclick = (e) => {
+      if (e.target.closest('.card-btn')) return;
+      openSession();
+    };
+    $('.card-btn-open', card).onclick = openSession;
+  } else {
+    card.onclick = (e) => {
+      if (e.target.closest('.card-btn')) return;
+      navigate('session', { id: s.id, name: s.name });
+    };
+    $('.card-btn-open', card).onclick = () => navigate('session', { id: s.id, name: s.name });
+  }
+
+  if (s.status !== 'offline') {
+    $('.card-btn-kill', card).onclick = (e) => {
+      e.stopPropagation();
+      if (confirm(`${s.status === 'dead' ? 'Remove' : 'Kill'} "${s.name}"?`)) {
+        api.del(`/api/sessions/${s.id}`);
+      }
+    };
+  }
+
+  return card;
+}
+
+function renderTreeNode(parentEl, node, depth) {
+  const group = document.createElement('div');
+  group.className = 'tree-group';
+
+  // Directory header
+  const header = document.createElement('div');
+  header.className = 'tree-dir-header';
+  header.style.paddingLeft = (depth * 16 + 12) + 'px';
+
+  const total = countSessions(node);
+  const collapsed = collapseState[node.path];
+
+  const chevron = document.createElement('span');
+  chevron.className = 'tree-toggle';
+  chevron.textContent = collapsed ? '▶' : '▼';
+
+  const icon = document.createElement('span');
+  icon.className = 'dir-item-icon';
+  icon.textContent = '📁';
+
+  const name = document.createElement('span');
+  name.className = 'dir-item-name';
+  name.textContent = node.label;
+
+  const count = document.createElement('span');
+  count.className = 'tree-count';
+  count.textContent = `${total}`;
+
+  header.append(chevron, icon, name, count);
+  header.onclick = () => {
+    collapseState[node.path] = !collapseState[node.path];
+    saveCollapseState();
+    renderDashboard();
+  };
+
+  // Content container
+  const content = document.createElement('div');
+  content.className = 'tree-dir-content';
+  if (collapsed) content.classList.add('collapsed');
+
+  for (const s of node.sessions) content.appendChild(renderSessionCard(s));
+  for (const child of node.children) renderTreeNode(content, child, depth + 1);
+
+  group.append(header, content);
+  parentEl.appendChild(group);
 }
 
 function renderDashboard() {
@@ -565,62 +789,9 @@ function renderDashboard() {
   empty?.classList.add('hidden');
 
   grid.innerHTML = '';
-  for (const s of state.sessions) {
-    const card = cloneTemplate('tpl-session-card');
-    card.dataset.id = s.id;
-    card.dataset.status = s.status;
+  const tree = buildSessionTree(state.sessions);
+  for (const node of tree) renderTreeNode(grid, node, 0);
 
-    $('.card-name', card).textContent = s.name;
-    $('.card-cwd', card).textContent = shortenPath(s.cwd);
-
-    const dot = $('.card-status-dot', card);
-    dot.classList.add(s.status);
-
-    const label = $('.card-status-label', card);
-    label.textContent = s.status;
-    label.classList.add(s.status);
-
-    if (s.attentionPreview) {
-      $('.card-preview', card).textContent = s.attentionPreview;
-    }
-
-    $('.card-time', card).textContent = timeAgo(s.lastActivity);
-
-    // Events
-    if (s.status === 'dead') {
-      // Dead session — reconnect on tap
-      const openSession = async () => {
-        try {
-          await api.post(`/api/sessions/${s.id}/reconnect`);
-          navigate('session', { id: s.id, name: s.name });
-        } catch (err) {
-          console.error('Reconnect failed:', err);
-        }
-      };
-      card.onclick = (e) => {
-        if (e.target.closest('.card-btn')) return;
-        openSession();
-      };
-      $('.card-btn-open', card).onclick = openSession;
-    } else {
-      card.onclick = (e) => {
-        if (e.target.closest('.card-btn')) return;
-        navigate('session', { id: s.id, name: s.name });
-      };
-      $('.card-btn-open', card).onclick = () => navigate('session', { id: s.id, name: s.name });
-    }
-
-    $('.card-btn-kill', card).onclick = (e) => {
-      e.stopPropagation();
-      if (confirm(`${s.status === 'dead' ? 'Remove' : 'Kill'} "${s.name}"?`)) {
-        api.del(`/api/sessions/${s.id}`);
-      }
-    };
-
-    grid.appendChild(card);
-  }
-
-  // Update subtitle
   const sub = $('#server-info');
   if (sub) sub.textContent = state.connected ? `Connected · ${state.sessions.length} session(s)` : 'Reconnecting…';
 }
@@ -779,7 +950,12 @@ function initSessionView(sessionId) {
   const sendBtn = $('#send-btn');
 
   function sendCommand() {
-    const val = cmdInput.value;
+    // Fix smart punctuation from mobile keyboards (e.g. -- → em dash)
+    const val = cmdInput.value
+      .replace(/\u2014/g, '--')   // em dash → --
+      .replace(/\u2013/g, '-')    // en dash → -
+      .replace(/\u2018|\u2019/g, "'")  // smart single quotes
+      .replace(/\u201C|\u201D/g, '"'); // smart double quotes
     if (!val && !val.trim()) {
       // Empty input — just send Enter
       wsSend({ type: 'input', sessionId, data: '\r' });

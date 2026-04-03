@@ -1,75 +1,104 @@
-# Claude Remote ⌘
+# Claude Remote
 
 Control Claude Code on your computer from your Android phone. Multi-session dashboard, real terminal output, voice I/O, and push notifications when Claude needs your attention.
 
 ```
 ┌─────────────────┐                      ┌───────────────────────┐
 │  Android Phone   │ ◄── WebSocket ────► │  Your Workstation     │
-│                  │    (local network)   │                       │
+│                  │    (Tailscale/LAN)   │                       │
 │  Dashboard       │                      │  Node.js Server       │
-│  ├─ Session 1 🟢 │                      │  ├─ pty: claude (proj1)│
-│  ├─ Session 2 🟡 │                      │  ├─ pty: claude (proj2)│
-│  └─ Session 3 ⚪ │                      │  └─ pty: bash          │
+│  ├─ Session 1    │                      │  ├─ pty: claude (proj1)│
+│  ├─ Session 2    │                      │  ├─ pty: claude (proj2)│
+│  └─ Session 3    │                      │  └─ pty: bash          │
 │                  │                      │                       │
-│  🎙 Voice input  │                      │  REST API + WebSocket  │
-│  🔈 TTS output   │                      │  Session management    │
-│  📳 Alerts       │                      │  File browsing         │
+│  Voice input     │                      │  REST API + WebSocket  │
+│  TTS output      │                      │  Admin panel           │
+│  Push alerts     │                      │  System tray icon      │
 └─────────────────┘                      └───────────────────────┘
+```
+
+## Quick Start
+
+### Prerequisites
+
+- **Node.js 18+**
+- **C++ build tools** (needed by `node-pty`):
+  - Linux: `sudo apt install -y build-essential python3`
+  - macOS: `xcode-select --install`
+  - Windows: `npm install -g windows-build-tools` (as Administrator)
+- **Tailscale** (recommended for remote access): install on both your workstation and phone
+
+### Setup
+
+```bash
+git clone https://github.com/kaleLetendre/claude-remote.git
+cd claude-remote
+./cli.js setup
+```
+
+The interactive setup will:
+1. Install server dependencies
+2. Check for Tailscale and guide you through setup
+3. Generate an auth token
+4. Optionally set a password for phone login
+5. Show your connection URL
+6. Offer to start the server
+
+### Connect from your phone
+
+**Option A — Browser (fastest to test):**
+Open the server URL on your phone's browser. Works immediately.
+
+**Option B — Android app (recommended):**
+Download the APK from [GitHub Releases](https://github.com/kaleLetendre/claude-remote/releases/latest), install it, and enter your server URL + password.
+
+The APK only bundles a login screen. After authentication, it loads the full UI from your server — so app updates are instant (no APK rebuild needed for most changes).
+
+### Day-to-day usage
+
+```bash
+# Start server (headless, auto-restarts on crash/update)
+./run.sh start
+
+# Or start with desktop tray icon + admin panel
+./run.sh desktop
+
+# Install to start automatically on login
+./run.sh install
 ```
 
 ## Architecture
 
 **Server** (`server/`) — Node.js + Express + WebSocket + node-pty
-- Manages multiple independent terminal sessions
-- Each session is a real pseudo-terminal (pty) that can run Claude Code, bash, or anything
+- Manages multiple independent terminal sessions (real pseudo-terminals)
 - Detects when Claude asks questions and pushes attention alerts
 - Tracks session status: `idle` → `working` → `waiting` → `done`
-- REST API for session CRUD + file browsing
+- REST API for session CRUD, file browsing, auth, and admin
 - WebSocket for real-time terminal I/O streaming
+- Git-based updater checks remote for new commits, can pull + restart
 
 **Client** (`client/www/`) — Vanilla HTML/CSS/JS, no framework
-- Capacitor-wrapped native Android app
+- Loaded from the server after login (not bundled in APK)
 - Dashboard with session cards showing live status
-- Full terminal view with xterm.js (raw mode) and a cleaned-up readable view (toggle)
+- Full terminal view (xterm.js raw mode) and cleaned-up readable view (toggle)
 - Directory browser for picking project folders
-- STT (Speech-to-Text) via Web Speech API
-- TTS (Text-to-Speech) with smart filtering to only read Claude's output
+- STT (Speech-to-Text) and TTS (Text-to-Speech) via Web Speech API
 - Push notifications via Capacitor Local Notifications
 
-## Quick Start
+**Desktop App** (`desktop/`) — Electron tray app (optional)
+- System tray icon: green = healthy, red = offline
+- Right-click menu: Open Admin, Copy Token, Copy Phone URL, Restart, Quit
+- Admin panel at `localhost:{port}/admin` for managing server, passwords, viewing clients/sessions
+- Minimizes to tray on close (like Discord)
 
-```bash
-# Clone and setup
-chmod +x setup.sh
-./setup.sh
+**CLI** (`cli.js`) — Headless management tool
+- Everything the admin panel can do, from the command line
+- Commands: `setup`, `start`, `status`, `token`, `url`, `clients`, `sessions`, `set-password`, `remove-password`, `restart`, `check-update`, `apply-update`, `build-apk`
 
-# Start the server
-cd server
-npm start
-```
-
-The server prints your connection URL with auth token. Then either:
-
-**Option A — Browser (fastest to test)**
-Open the URL on your phone's browser. Works immediately.
-
-**Option B — Native Android App**
-```bash
-cd client
-
-# Edit capacitor.config.ts:
-# Uncomment the server.url line and set it to your server's LAN IP
-# e.g., url: 'http://192.168.1.42:3033'
-
-npx cap sync android
-npx cap open android     # Opens in Android Studio → Build & Run
-```
-
-**Option C — Direct device deploy**
-```bash
-cd client
-npx cap run android      # Deploys to connected USB device
-```
+**Bootstrap** (`client/bootstrap/`) — Login screen bundled in the APK
+- Password field (primary) with token as advanced fallback
+- Auto-connects if saved credentials exist
+- Checks for APK updates before redirecting to the server
 
 ## How It Works
 
@@ -110,31 +139,27 @@ Quick action buttons let you respond with one tap: Yes, No, Enter, Ctrl-C.
 
 ## Configuration
 
-Server environment variables (or `.env` file in `server/`):
+Server settings are stored in `data/server-settings.json` (auto-generated, git-ignored). You can manage them via the admin panel, CLI, or by editing the file directly.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | `3033` | Server port |
-| `AUTH_TOKEN` | random | Fixed auth token |
-| `SHELL` | `$SHELL` or `/bin/bash` | Default shell for new sessions |
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `port` | `3033` | Server port |
+| `authToken` | random | Auth token (generated on first run) |
+| `password` | `null` | Password hash (set via admin panel or `cli.js set-password`) |
+| `shell` | `$SHELL` or `/bin/bash` | Default shell for new sessions |
+| `autoUpdate` | `false` | Auto-check for git updates |
 
-## Development Mode
+Environment variable overrides:
 
-For development, you can point the Capacitor app directly at your running server instead of bundling the web assets. In `capacitor.config.ts`, uncomment:
+| Variable | Description |
+|----------|-------------|
+| `PORT` | Override server port |
+| `CLAUDE_REMOTE_DATA` | Override data directory (default: `~/.claude-remote`) |
 
-```typescript
-server: {
-  url: 'http://YOUR_LAN_IP:3033?token=YOUR_TOKEN',
-  cleartext: true,
-},
-```
-
-This gives you live reload — edit `client/www/` files, refresh the app.
-
-## Remote Access (Outside Local Network)
+## Remote Access
 
 **Tailscale** (recommended):
-Install on both devices, then use the Tailscale IP instead of your LAN IP.
+Install on both your workstation and phone, sign in with the same account. The server auto-detects its Tailscale IP on startup and prints a ready-to-use URL.
 
 **Cloudflare Tunnel**:
 ```bash
@@ -146,173 +171,130 @@ cloudflared tunnel --url http://localhost:3033
 ssh -L 3033:localhost:3033 user@your-machine
 ```
 
+## CLI Reference
+
+```bash
+./cli.js setup            # Interactive first-time setup
+./cli.js start            # Start the server
+./cli.js status           # Show server status, IPs, clients, sessions
+./cli.js token            # Print auth token
+./cli.js url              # Print phone connection URL
+./cli.js clients          # List connected clients
+./cli.js sessions         # List active sessions
+./cli.js set-password     # Set server password
+./cli.js remove-password  # Remove server password
+./cli.js restart          # Restart the server
+./cli.js check-update     # Check for updates
+./cli.js apply-update     # Apply available update
+./cli.js build-apk        # Build Android APK (--dev for dev build)
+```
+
 ## Project Structure
 
 ```
 claude-remote/
+├── cli.js                 # CLI management tool
+├── runner.js              # Process runner (handles restart loop)
+├── run.sh                 # Shell wrapper (start, desktop, install, update)
+├── version.json           # Version + settings schema version + changelog
+├── package.json
+├── lib/
+│   └── paths.js           # Canonical path resolution
 ├── server/
-│   ├── server.js          # Express + WS + REST API + update endpoints
+│   ├── server.js          # Express + WS + REST API
 │   ├── sessions.js        # Multi-session pty manager
 │   ├── updater.js         # Git-based update checker + applier
 │   ├── settings.js        # Versioned settings with migration support
 │   └── package.json
 ├── client/
-│   ├── www/               # Web assets (served by Capacitor + server)
-│   │   ├── index.html     # SPA shell + templates
+│   ├── bootstrap/         # Login screen (bundled in APK)
+│   │   └── index.html
+│   ├── www/               # Full app (loaded from server after login)
+│   │   ├── index.html     # SPA shell + view templates
+│   │   ├── admin.html     # Admin panel
 │   │   ├── css/style.css  # Industrial terminal aesthetic
-│   │   └── js/app.js      # Client logic (routing, views, TTS, STT, updates)
+│   │   └── js/app.js      # Client logic
 │   ├── capacitor.config.ts
 │   ├── package.json
-│   └── android/           # Generated by `npx cap add android`
+│   └── android/           # Capacitor Android project
+├── desktop/
+│   ├── main.js            # Electron tray app
+│   ├── assets/            # Tray icons
+│   └── package.json
+├── scripts/
+│   └── postinstall.js     # npm postinstall hook
 ├── data/                  # User data (git-ignored, survives updates)
-│   └── .gitignore
-├── version.json           # Version + settings schema version + changelog
-├── run.sh                 # Process wrapper (auto-restart on update)
-├── setup.sh               # One-time setup script
-├── .gitignore
-└── README.md
+│   └── server-settings.json
+└── setup.sh               # Legacy setup (use cli.js setup instead)
 ```
 
-## Deployment Pipeline
+## Updates
 
-The app is designed to be developed from itself. The update system is git-based — your repo is the deployment target.
+The app is designed to be developed from itself. Updates are git-based.
 
-### How Updates Work
+### How updates reach your phone
 
-```
-You (on phone)                    Your Computer
-     │                                 │
-     │  "claude, fix the TTS bug"      │
-     │  ──────────────────────────►    │
-     │                                 │  Claude Code edits files
-     │                                 │  git commit + git push
-     │                                 │
-     │                     server checks remote periodically
-     │                                 │
-     │  ◄── update:available ────────  │
-     │  "Update available v0.2.0"      │
-     │                                 │
-     │  tap "Update & Restart"         │
-     │  ──────────────────────────►    │
-     │                                 │  git pull
-     │                                 │  npm install (if needed)
-     │                                 │  server restarts
-     │                                 │
-     │  ◄── reconnect ───────────────  │
-     │  client reloads new assets      │
-     │  done.                          │
-```
+**Web updates (instant):** The APK loads its UI from the server. Any change to `client/www/` is live immediately — phones see it on next load. This covers UI changes, features, settings, and bug fixes.
 
-### Server Updates
+**Server updates:** Require a server restart after pulling new code. Use the admin panel, phone app, or CLI: `./cli.js apply-update`.
 
-**From the CLI** (on your computer):
+**APK updates (rare):** Only needed when Capacitor plugins change or the bootstrap login screen itself changes. Build with `./cli.js build-apk`, then phones are prompted to download on next connect.
+
+### Updating
+
+**From the CLI:**
 ```bash
-./run.sh update     # Interactive: shows changes, asks to confirm
+./run.sh update       # Interactive: shows changes, asks to confirm
+./cli.js apply-update # Or via the API
 ```
 
-**From the app** (on your phone):
+**From the phone:**
 Settings → Check for updates → Update & Restart
 
-**Auto-update** (headless):
-```bash
-AUTO_UPDATE=true ./run.sh start
-```
-Or set `autoUpdate: true` in `data/server-settings.json`. The server checks every 5 minutes, pushes an `update:available` message to all clients, but waits for you to confirm.
+**Auto-update:**
+Set `autoUpdate: true` in settings. The server checks every 5 minutes and pushes an `update:available` message to all clients.
 
-### Client Updates
-
-Since the Capacitor app loads its UI from the server URL (not bundled assets), updating the server **automatically updates the client**. When you tap "Update & Restart":
-
-1. Server pulls new code from git
-2. Server restarts with new `client/www/` files
-3. Your phone's WebSocket reconnects
-4. Page reloads → you're on the new version
-
-The native Android shell itself (Capacitor wrapper) rarely needs rebuilding — only if you add new native plugins or change `capacitor.config.ts`.
-
-### Self-Development Workflow
-
-This is the intended workflow for building the app from itself:
+### Self-development workflow
 
 1. Open the app on your phone
 2. Create a session pointed at the `claude-remote/` repo directory
 3. Launch Claude Code in that session
-4. Tell Claude what to build/fix/improve
-5. Claude edits the source files, commits, pushes
-6. Your phone shows "Update available"
-7. Tap update → server restarts → you see the changes
+4. Tell Claude what to build/fix
+5. Claude edits files, commits, pushes
+6. Phone shows "Update available" → tap to update
+7. Server restarts → you see the changes
 
-You're literally editing the UI you're looking at through the terminal you're using.
+### Version management
 
-### Settings Survive Updates
-
-Settings are stored separately from code:
-
-**Server settings**: `data/server-settings.json` (git-ignored)
-**Client settings**: `localStorage` on your phone
-
-Both use versioned schemas. When the settings schema changes, migration functions run automatically on startup. The version is tracked in `version.json`:
-
-```json
-{
-  "version": "0.2.0",
-  "settingsVersion": 2,    ← bump this when schema changes
-  ...
-}
-```
-
-Add migration functions in `server/settings.js` (server-side) or the `migrations` object in `app.js` (client-side).
-
-### Version Management
-
-Version bumps happen in `version.json`. The changelog there is served to clients so the update banner can show what changed. Convention:
-
-```bash
-# After making changes:
-# 1. Edit version.json (bump version, add changelog entry)
-# 2. Commit everything
-# 3. Push
-# 4. Clients see the update
-```
+`version.json` is the single source of truth. Bump `version`, add a changelog entry, commit and push. If the settings schema changed, bump `settingsVersion` and add a migration in `server/settings.js`.
 
 ### Rebuilding the APK
 
-If you do need to rebuild the native Android app (rare):
-
 ```bash
-cd client
-npx cap sync android       # Copy www/ into android project
-npx cap open android        # Open in Android Studio → Build
-# or
-npx cap run android         # Build + deploy to connected device
+./cli.js build-apk          # Production build
+./cli.js build-apk --dev    # Dev build (separate app ID, can install alongside prod)
+
+# Or manually:
+cd client && npx cap sync android && cd android && ./gradlew assembleDebug
+
+# Install to connected phone:
+adb install -r client/android/app/build/outputs/apk/debug/app-debug.apk
 ```
-
-### Using run.sh
-
-Always start the server via `run.sh` — it wraps the Node process and handles restarts:
-
-```bash
-./run.sh start      # Start server (auto-restarts on crash or update)
-./run.sh update     # Interactive update from git
-./run.sh version    # Print current version
-```
-
-When the server receives an update request via the API, it exits with code 75. `run.sh` catches this and restarts it automatically.
 
 ## Troubleshooting
 
-**node-pty won't install**: You need native build tools.
-```bash
-# macOS
-xcode-select --install
-# Ubuntu
-sudo apt install build-essential python3
-```
+**node-pty won't install:** You need C++ build tools. See Prerequisites above.
 
-**Can't connect from phone**: Both devices must be on the same WiFi. Check firewall allows port 3033.
+**Can't connect from phone:** Make sure both devices are on the same network (or both on Tailscale). Check firewall allows the server port.
 
-**xterm.js not loading**: The app loads xterm.js from cdnjs.cloudflare.com. If offline, download the files to `client/www/lib/` and update the script tags in index.html.
+**Tray icon shows red but server works:** Token mismatch — the tray and server may be reading different settings files. Make sure `CLAUDE_REMOTE_DATA` is set consistently, or restart the tray.
 
-**STT not working**: Android Chrome requires HTTPS for mic access in some versions. Either use Capacitor (native app has mic permission), or set up an SSL tunnel.
+**xterm.js not loading:** The app loads xterm.js from CDN. If offline, download the files to `client/www/lib/` and update the script tags.
 
-**Capacitor build fails**: Make sure you have Android Studio installed with SDK 33+, and that `ANDROID_HOME` is set.
+**STT not working:** Android Chrome requires HTTPS for mic access in some versions. The native Capacitor app has mic permission built in.
+
+**Capacitor build fails:** Make sure you have Android Studio with SDK 33+ and `ANDROID_HOME` set.
+
+## License
+
+MIT
