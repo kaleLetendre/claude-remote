@@ -16,22 +16,13 @@ const state = {
   currentView: 'dashboard',
 
   // Settings (persisted to localStorage)
-  ttsEnabled: false,
-  smartTts: false,
   alertsEnabled: true,
   alertPrompt: true,
   alertIdle: true,
-  speechRate: 1.1,
-  selectedVoiceURI: null,
-  sttLang: 'en-US',
 
   // Runtime
-  recording: false,
-  recognition: null,
   xterm: null,
   fitAddon: null,
-  ttsAccum: '',
-  ttsTimer: null,
 };
 
 function loadSettings() {
@@ -54,8 +45,7 @@ function loadSettings() {
 
 function saveSettings() {
   const keys = [
-    'ttsEnabled', 'smartTts', 'alertsEnabled', 'alertPrompt', 'alertIdle', 'speechRate',
-    'selectedVoiceURI', 'sttLang', 'serverUrl', 'token',
+    'alertsEnabled', 'alertPrompt', 'alertIdle', 'serverUrl', 'token',
   ];
   const obj = {};
   keys.forEach(k => obj[k] = state[k]);
@@ -377,7 +367,6 @@ function handleWSMessage(msg) {
       console.log('[ws] output for', msg.sessionId, 'active:', state.activeSessionId, 'match:', msg.sessionId === state.activeSessionId, 'len:', msg.data?.length);
       if (msg.sessionId === state.activeSessionId) {
         appendTerminalOutput(msg.data);
-        accumulateForTTS(msg.data);
       }
       break;
 
@@ -980,13 +969,6 @@ function initSessionView(sessionId) {
     }
   });
 
-  // Mic button
-  initSTT();
-  const micBtn = $('#mic-btn');
-  if (micBtn) {
-    micBtn.onclick = toggleRecording;
-  }
-
   // Attention dismiss
   const dismissBtn = $('#attention-dismiss');
   if (dismissBtn) dismissBtn.onclick = dismissAttention;
@@ -1300,9 +1282,6 @@ function handleAttention(sessionId, reason, preview) {
       }
     } catch {}
 
-    if (state.ttsEnabled) {
-      speak(preview || 'Claude needs input.');
-    }
   } else if (reason === 'idle') {
     // Output finished
     if (navigator.vibrate) navigator.vibrate([100]);
@@ -1318,9 +1297,6 @@ function handleAttention(sessionId, reason, preview) {
       }
     } catch {}
 
-    if (state.ttsEnabled) {
-      speak(`${name} output finished.`);
-    }
   }
 
   // Show in-app toast regardless of view
@@ -1389,117 +1365,6 @@ function checkMissedAttention() {
 function dismissAttention() {
   const bar = $('#attention-bar');
   if (bar) bar.classList.add('hidden');
-}
-
-// ── TTS ─────────────────────────────────────────────────────
-
-function accumulateForTTS(data) {
-  if (!state.ttsEnabled) return;
-
-  state.ttsAccum += stripAnsi(data);
-  clearTimeout(state.ttsTimer);
-
-  state.ttsTimer = setTimeout(() => {
-    let text = state.ttsAccum.trim();
-    state.ttsAccum = '';
-    if (!text || text.length < 5) return;
-
-    if (state.smartTts) {
-      // Filter out shell noise
-      const lines = text.split('\n').filter(line => {
-        const t = line.trim();
-        if (!t) return false;
-        if (t.startsWith('$') || t.startsWith('>') || t.startsWith('#')) return false;
-        if (t.startsWith('diff ') || t.startsWith('---') || t.startsWith('+++')) return false;
-        if (t.startsWith('@@')) return false;
-        if (/^[a-z_\/.\-]+(:[0-9]+)?$/i.test(t)) return false;
-        if (t.startsWith('{') || t.startsWith('}') || t.startsWith('[')) return false;
-        return true;
-      });
-      text = lines.join('. ');
-    }
-
-    if (text.length > 5) speak(text);
-  }, 900);
-}
-
-function speak(text) {
-  if (!('speechSynthesis' in window)) return;
-  if (text.length > 800) text = text.slice(0, 800) + '… truncated.';
-
-  const utt = new SpeechSynthesisUtterance(text);
-  utt.rate = state.speechRate;
-  utt.pitch = 1.0;
-
-  if (state.selectedVoiceURI) {
-    const voice = speechSynthesis.getVoices().find(v => v.voiceURI === state.selectedVoiceURI);
-    if (voice) utt.voice = voice;
-  }
-
-  speechSynthesis.cancel();
-  speechSynthesis.speak(utt);
-}
-
-// ── STT ─────────────────────────────────────────────────────
-
-function initSTT() {
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR) {
-    const mic = $('#mic-btn');
-    if (mic) mic.style.display = 'none';
-    return;
-  }
-
-  if (state.recognition) return; // already init
-
-  const recog = new SR();
-  recog.continuous = false;
-  recog.interimResults = true;
-  recog.lang = state.sttLang;
-  state.recognition = recog;
-
-  recog.onresult = (e) => {
-    let transcript = '';
-    for (let i = e.resultIndex; i < e.results.length; i++) {
-      transcript += e.results[i][0].transcript;
-    }
-    const input = $('#cmd-input');
-    if (input) {
-      input.value = transcript;
-      input.style.height = 'auto';
-      input.style.height = Math.min(input.scrollHeight, 120) + 'px';
-    }
-
-    if (e.results[e.results.length - 1].isFinal) {
-      setTimeout(() => $('#send-btn')?.click(), 400);
-    }
-  };
-
-  recog.onend = () => {
-    state.recording = false;
-    $('#mic-btn')?.classList.remove('recording');
-  };
-
-  recog.onerror = () => {
-    state.recording = false;
-    $('#mic-btn')?.classList.remove('recording');
-  };
-}
-
-function toggleRecording() {
-  if (!state.recognition) return;
-
-  if (state.recording) {
-    state.recognition.stop();
-    state.recording = false;
-    $('#mic-btn')?.classList.remove('recording');
-  } else {
-    state.recognition.lang = state.sttLang;
-    state.recognition.start();
-    state.recording = true;
-    $('#mic-btn')?.classList.add('recording');
-    speechSynthesis.cancel();
-  }
 }
 
 // ── Settings View ───────────────────────────────────────────
@@ -1671,15 +1536,6 @@ $('#btn-settings').onclick = () => {
   if (state.currentView === 'settings') navigate('dashboard');
   else navigate('settings');
 };
-const voiceBtn = $('#btn-voice');
-if (voiceBtn) {
-  voiceBtn.onclick = () => {
-    state.ttsEnabled = !state.ttsEnabled;
-    voiceBtn.classList.toggle('active', state.ttsEnabled);
-    if (!state.ttsEnabled) speechSynthesis.cancel();
-    saveSettings();
-  };
-}
 
 // ── Init ────────────────────────────────────────────────────
 
