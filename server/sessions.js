@@ -39,8 +39,9 @@ const CLAUDE_IDLE_PATTERNS = [
 ];
 
 export class SessionManager extends EventEmitter {
-  constructor() {
+  constructor({ port = 3033 } = {}) {
     super();
+    this.port = String(port);
     this.sessions = new Map();
     this._restoreSessions();
   }
@@ -102,7 +103,7 @@ export class SessionManager extends EventEmitter {
     if (!session) throw new Error('Session not found');
     if (session.pty) throw new Error('Session is already alive');
 
-    const ptyEnv = { ...process.env, TERM: 'xterm-256color', CLAUDE_REMOTE_SESSION_ID: id };
+    const ptyEnv = { ...process.env, TERM: 'xterm-256color', CLAUDE_REMOTE_SESSION_ID: id, CLAUDE_REMOTE_PORT: this.port };
     delete ptyEnv.npm_config_prefix;
     delete ptyEnv.npm_config_local_prefix;
 
@@ -138,7 +139,7 @@ export class SessionManager extends EventEmitter {
     }
 
     // Clean env for pty — remove npm_config_prefix which breaks NVM
-    const ptyEnv = { ...process.env, TERM: 'xterm-256color', CLAUDE_REMOTE_SESSION_ID: id };
+    const ptyEnv = { ...process.env, TERM: 'xterm-256color', CLAUDE_REMOTE_SESSION_ID: id, CLAUDE_REMOTE_PORT: this.port };
     delete ptyEnv.npm_config_prefix;
     delete ptyEnv.npm_config_local_prefix;
 
@@ -291,8 +292,9 @@ export class SessionManager extends EventEmitter {
 
   // ── Hook-based status detection (from Claude Code hooks) ──────────
   handleHookEvent(hookType, sessionId, hookData) {
+    console.log(`[hook] type=${hookType} session=${sessionId} data=${JSON.stringify(hookData)?.slice(0, 200)}`);
     const session = this.sessions.get(sessionId);
-    if (!session) return; // Not our session (different instance)
+    if (!session) { console.log(`[hook] session not found: ${sessionId}`); return; }
 
     session._hookActive = true;
     session._lastHookEvent = Date.now();

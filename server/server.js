@@ -28,7 +28,7 @@ const AUTO_UPDATE = settings.autoUpdate;
 // ── App Setup ───────────────────────────────────────────────────────
 const app = express();
 const server = createServer(app);
-const sessions = new SessionManager();
+const sessions = new SessionManager({ port: PORT });
 const updater = new Updater({ autoCheck: AUTO_UPDATE });
 
 // Forward update events to all WS clients
