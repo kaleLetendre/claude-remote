@@ -83,7 +83,8 @@ The APK only bundles a login screen. After authentication, it loads the full UI 
 - Dashboard with session cards showing live status
 - Full terminal view (xterm.js raw mode) and cleaned-up readable view (toggle)
 - Directory browser for picking project folders
-- STT (Speech-to-Text) and TTS (Text-to-Speech) via Web Speech API
+- Voice mode: push-to-talk STT (Android SpeechRecognition by default, with optional server-side Whisper for higher accuracy) + native Android TTS via a side-channel `speak` shell script
+- Hands-free slash commands via "system command X" voice prefix
 - Push notifications via Capacitor Local Notifications
 
 **Desktop App** (`desktop/`) — Electron tray app (optional)
@@ -122,10 +123,16 @@ Toggle between two modes:
 
 ### Voice Workflow
 
-1. Enable TTS via the speaker icon in the top bar
-2. Turn on "Smart TTS" in settings to only hear Claude's words (filters out diffs, file paths, shell prompts)
-3. Tap the mic to speak commands — speech is transcribed and sent as terminal input
-4. Auto-sends when you stop speaking
+Voice mode is a dedicated overlay, not a setting. Open a session, toggle voice mode, and:
+
+1. **Push and hold the talk button** — speech is transcribed via Android SpeechRecognition, sent to Claude when you release.
+2. **Claude responds via native Android TTS** — Claude runs `speak "summary"` at end of turn, the phone plays it through the system TTS engine (routes through media audio, so Bluetooth / headphones work).
+   - **Optional server-side Whisper STT** — from the admin panel, install `faster-whisper` into a managed venv, download a model, and enable it. The phone then captures audio in parallel and prefers the Whisper transcript when it lands before the user dispatches; Android STT remains the fallback if Whisper is slow or disabled.
+3. **Hands-free slash commands** — say `"system command <name>"` to fire any slash command without the voice wrapper. Examples: *"system command clear"*, *"system command compact"*, *"system command cost"*, *"system command model opus"*, *"system command stop"* (Ctrl+C). For informational commands like `/cost` the client auto-summarizes the output via TTS.
+
+Target use case: hands-free **emergency server ops** (restart a service, flush a cache, roll back a deploy) while driving or away from the desk. Define domain operations as Claude Code skills — they auto-wire as voice commands via the "system command" prefix.
+
+See VOICE-PLAN.md for the full voice architecture.
 
 ### Attention System
 
@@ -140,7 +147,7 @@ Quick action buttons let you respond with one tap: Yes, No, Enter, Ctrl-C.
 
 ## Configuration
 
-Server settings are stored in `data/server-settings.json` (auto-generated, git-ignored). You can manage them via the admin panel, CLI, or by editing the file directly.
+Server settings are stored in `~/.claude-remote/server-settings.json` (auto-generated; override the location with `CLAUDE_REMOTE_DATA`). Manage them via the admin panel, CLI, or by editing the file directly.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
@@ -149,13 +156,16 @@ Server settings are stored in `data/server-settings.json` (auto-generated, git-i
 | `password` | `null` | Password hash (set via admin panel or `cli.js set-password`) |
 | `shell` | `$SHELL` or `/bin/bash` | Default shell for new sessions |
 | `autoUpdate` | `false` | Auto-check for git updates |
+| `whisper.enabled` | `false` | Use server-side Whisper STT instead of Android-only |
+| `whisper.model` | `null` | Installed model name (e.g. `small.en`, `large-v3-turbo`) |
+| `whisper.device` | `auto` | `auto` / `cpu` / `cuda` |
 
 Environment variable overrides:
 
 | Variable | Description |
 |----------|-------------|
 | `PORT` | Override server port |
-| `CLAUDE_REMOTE_DATA` | Override data directory (default: `~/.claude-remote`) |
+| `CLAUDE_REMOTE_DATA` | Override data directory (default: `~/.claude-remote`). Use different values for prod and dev so their tokens/sessions/Whisper state stay separate. |
 
 ## Remote Access
 
@@ -195,39 +205,58 @@ ssh -L 3033:localhost:3033 user@your-machine
 
 ```
 claude-remote/
-├── cli.js                 # CLI management tool
-├── runner.js              # Process runner (handles restart loop)
-├── run.sh                 # Shell wrapper (start, desktop, install, update)
-├── version.json           # Version + settings schema version + changelog
+├── cli.js                        # CLI management tool
+├── run.sh                        # Shell wrapper (start, desktop, install, update)
+├── version.json                  # Version + settings schema version + changelog
 ├── package.json
+├── CLAUDE.md                     # Project handoff for future Claude Code sessions
+├── FEATURES.md                   # Full feature list
+├── LIMITATIONS.md                # Known gaps and future work
+├── VOICE-PLAN.md                 # Voice architecture
 ├── lib/
-│   └── paths.js           # Canonical path resolution
+│   └── paths.js                  # Canonical path resolution (CLAUDE_REMOTE_DATA aware)
 ├── server/
-│   ├── server.js          # Express + WS + REST API
-│   ├── sessions.js        # Multi-session pty manager
-│   ├── updater.js         # Git-based update checker + applier
-│   ├── settings.js        # Versioned settings with migration support
+│   ├── server.js                 # Express + WS + REST API
+│   ├── sessions.js               # Multi-session pty manager
+│   ├── updater.js                # Git-based update checker + applier
+│   ├── settings.js               # Versioned settings with migration support
+│   ├── whisper-manager.js        # Server-side Whisper lifecycle (venv, models, helper)
+│   ├── whisper/transcribe.py     # Long-lived faster-whisper helper (JSON over stdio)
 │   └── package.json
 ├── client/
-│   ├── bootstrap/         # Login screen (bundled in APK)
+│   ├── bootstrap/                # Login screen (bundled in APK)
 │   │   └── index.html
-│   ├── www/               # Full app (loaded from server after login)
-│   │   ├── index.html     # SPA shell + view templates
-│   │   ├── admin.html     # Admin panel
-│   │   ├── css/style.css  # Industrial terminal aesthetic
-│   │   └── js/app.js      # Client logic
+│   ├── www/                      # Full app (loaded from server after login)
+│   │   ├── index.html            # SPA shell + view templates
+│   │   ├── admin.html            # Admin panel
+│   │   ├── css/style.css         # Industrial terminal aesthetic
+│   │   └── js/app.js             # Client logic
 │   ├── capacitor.config.ts
 │   ├── package.json
-│   └── android/           # Capacitor Android project
+│   └── android/                  # Capacitor Android project
+│       └── app/build.gradle      # syncAppVersion task reads version.json
 ├── desktop/
-│   ├── main.js            # Electron tray app
-│   ├── assets/            # Tray icons
+│   ├── main.js                   # Electron tray app
+│   ├── assets/                   # Tray icons
 │   └── package.json
 ├── scripts/
-│   └── postinstall.js     # npm postinstall hook
-├── data/                  # User data (git-ignored, survives updates)
-│   └── server-settings.json
-└── setup.sh               # Legacy setup (use cli.js setup instead)
+│   ├── speak                     # Voice TTS side-channel (Claude invokes)
+│   ├── cmd                       # Slash-command queue (Claude invokes)
+│   ├── claude-hook-relay.sh      # Notification hook → server
+│   ├── claude-preauth-hook.sh    # PreToolUse hook → server (auto-accept)
+│   ├── restart-dev.sh            # Safely restart dev server (port 3034)
+│   └── postinstall.js            # npm postinstall hook
+```
+
+Persistent user data lives **outside the repo** at `~/.claude-remote/` (override with `CLAUDE_REMOTE_DATA`):
+
+```
+~/.claude-remote/
+├── server-settings.json          # auth token, password, port, shell, whisper config
+├── sessions.json                 # session metadata for revive
+├── connection-info.json          # URLs + token, regenerated each boot
+├── whisper-venv/                 # managed Python venv (only if Whisper bootstrapped)
+└── whisper-models/               # installed Whisper models (HF cache)
 ```
 
 ## Updates

@@ -1,8 +1,11 @@
-package com.clauderemote.app;
+package com.clauderemote.dev;
 
 import android.content.Intent;
 import android.os.Build;
 import android.os.Bundle;
+import android.media.AudioAttributes;
+import android.speech.tts.TextToSpeech;
+import android.speech.tts.UtteranceProgressListener;
 import android.webkit.JavascriptInterface;
 import android.webkit.PermissionRequest;
 import android.webkit.WebChromeClient;
@@ -15,14 +18,35 @@ import android.os.Environment;
 import android.widget.Toast;
 import android.util.Log;
 
+import java.util.Locale;
+
 import com.getcapacitor.BridgeActivity;
 
 public class MainActivity extends BridgeActivity {
     private static final String TAG = "MainActivity";
+    private TextToSpeech tts;
+    private boolean ttsReady = false;
+    private float ttsRate = 1.1f;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        // Initialize native TTS
+        tts = new TextToSpeech(this, status -> {
+            if (status == TextToSpeech.SUCCESS) {
+                tts.setLanguage(Locale.US);
+                tts.setSpeechRate(ttsRate);
+                tts.setAudioAttributes(new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build());
+                ttsReady = true;
+                Log.d(TAG, "TTS initialized");
+            } else {
+                Log.e(TAG, "TTS init failed: " + status);
+            }
+        });
 
         // Request permissions on Android 13+
         if (Build.VERSION.SDK_INT >= 33) {
@@ -99,5 +123,37 @@ public class MainActivity extends BridgeActivity {
             Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
             startActivity(intent);
         }
+
+        @JavascriptInterface
+        public void speak(String text) {
+            if (!ttsReady || text == null || text.isEmpty()) return;
+            Log.d(TAG, "TTS speak: " + text.substring(0, Math.min(text.length(), 80)));
+            tts.speak(text, TextToSpeech.QUEUE_ADD, null, "voice-" + System.currentTimeMillis());
+        }
+
+        @JavascriptInterface
+        public void stopSpeaking() {
+            if (tts != null) tts.stop();
+        }
+
+        @JavascriptInterface
+        public void setSpeechRate(float rate) {
+            ttsRate = rate;
+            if (tts != null) tts.setSpeechRate(rate);
+        }
+
+        @JavascriptInterface
+        public boolean isTtsReady() {
+            return ttsReady;
+        }
+    }
+
+    @Override
+    public void onDestroy() {
+        if (tts != null) {
+            tts.stop();
+            tts.shutdown();
+        }
+        super.onDestroy();
     }
 }

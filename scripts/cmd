@@ -1,0 +1,28 @@
+#!/bin/bash
+# Usage: cmd <slash-command-name> [args...]
+#   cmd clear       → queues /clear
+#   cmd compact     → queues /compact
+#   cmd model opus  → queues "/model opus"
+# The command is queued on the Claude Remote server and injected into the pty
+# the moment this turn's Stop hook fires (so Claude Code's TUI prompt is ready).
+
+[ -z "$CLAUDE_REMOTE_SESSION_ID" ] && exit 0
+[ -z "$1" ] && exit 0
+
+SLASH="/$*"
+PORT="${CLAUDE_REMOTE_PORT:-3033}"
+
+if command -v jq >/dev/null 2>&1; then
+  BODY=$(jq -Rn --arg s "$CLAUDE_REMOTE_SESSION_ID" --arg c "$SLASH" '{sessionId:$s, command:$c}')
+elif command -v node >/dev/null 2>&1; then
+  BODY=$(CR_S="$CLAUDE_REMOTE_SESSION_ID" CR_C="$SLASH" node -e 'process.stdout.write(JSON.stringify({sessionId:process.env.CR_S,command:process.env.CR_C}))')
+elif command -v python3 >/dev/null 2>&1; then
+  BODY=$(CR_S="$CLAUDE_REMOTE_SESSION_ID" CR_C="$SLASH" python3 -c 'import os,json; print(json.dumps({"sessionId":os.environ["CR_S"],"command":os.environ["CR_C"]}))')
+else
+  exit 0
+fi
+
+curl -s -X POST "http://localhost:${PORT}/api/cmd/queue" \
+  -H "Content-Type: application/json" \
+  -d "$BODY" \
+  --max-time 2 >/dev/null 2>&1

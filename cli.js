@@ -221,58 +221,44 @@ async function cmdApplyUpdate() {
 }
 
 async function cmdBuildApk() {
-  const isDev = args.includes('--dev');
+  const { writeFileSync } = await import('fs');
   const clientDir = join(PACKAGE_ROOT, 'client');
   const androidDir = join(clientDir, 'android');
-  const buildGradle = join(androidDir, 'app', 'build.gradle');
-  const stringsXml = join(androidDir, 'app', 'src', 'main', 'res', 'values', 'strings.xml');
 
-  // For dev builds, temporarily patch app ID, name, and manifest
-  let origGradle, origStrings, origManifest;
-  const manifestXml = join(androidDir, 'app', 'src', 'main', 'AndroidManifest.xml');
-  if (isDev) {
-    console.log(C.dim('Patching for dev build (com.clauderemote.dev / CR Dev)...'));
-    const { writeFileSync } = await import('fs');
+  // ── Auto-bump version ──────────────────────────────────
+  const versionPath = join(PACKAGE_ROOT, 'version.json');
+  const versionData = JSON.parse(readFileSync(versionPath, 'utf8'));
+  const [major, minor, patch] = versionData.version.split('.').map(Number);
+  const newVersion = `${major}.${minor}.${patch + 1}`;
+  versionData.version = newVersion;
+  versionData.minClientVersion = newVersion;
+  writeFileSync(versionPath, JSON.stringify(versionData, null, 2) + '\n');
+  console.log(`${C.green('Version bumped')} → ${newVersion}`);
 
-    origGradle = readFileSync(buildGradle, 'utf8');
-    origStrings = readFileSync(stringsXml, 'utf8');
-    origManifest = readFileSync(manifestXml, 'utf8');
-
-    writeFileSync(buildGradle, origGradle
-      .replace(/namespace "com\.clauderemote\.app"/, 'namespace "com.clauderemote.dev"')
-      .replace(/applicationId "com\.clauderemote\.app"/, 'applicationId "com.clauderemote.dev"'));
-    writeFileSync(stringsXml, origStrings
-      .replace(/<string name="app_name">Claude Remote<\/string>/, '<string name="app_name">CR Dev</string>')
-      .replace(/<string name="title_activity_main">Claude Remote<\/string>/, '<string name="title_activity_main">CR Dev</string>')
-      .replace(/com\.clauderemote\.app/g, 'com.clauderemote.dev'));
-    // Use fully qualified class names so they resolve despite different namespace
-    writeFileSync(manifestXml, origManifest
-      .replace(/android:name="\.MainActivity"/, 'android:name="com.clauderemote.app.MainActivity"')
-      .replace(/android:name="\.AttentionPollerService"/, 'android:name="com.clauderemote.app.AttentionPollerService"'));
+  // Update bootstrap meta tag to match
+  const bootstrapPath = join(clientDir, 'bootstrap', 'index.html');
+  if (existsSync(bootstrapPath)) {
+    const html = readFileSync(bootstrapPath, 'utf8');
+    const updated = html.replace(
+      /(<meta name="app-version" content=")[^"]*(")/,
+      `$1${newVersion}$2`
+    );
+    writeFileSync(bootstrapPath, updated);
   }
 
-  try {
-    console.log(C.dim('Syncing Capacitor...'));
-    execSync('npx cap sync android', { cwd: clientDir, stdio: 'inherit' });
+  // ── Build ──────────────────────────────────────────────
+  console.log(C.dim('Syncing Capacitor...'));
+  execSync('npx cap sync android', { cwd: clientDir, stdio: 'inherit' });
 
-    console.log(C.dim('Building APK...'));
-    execSync('./gradlew assembleDebug', { cwd: androidDir, stdio: 'inherit' });
+  console.log(C.dim('Building APK...'));
+  execSync('./gradlew assembleDebug', { cwd: androidDir, stdio: 'inherit' });
 
-    const apkPath = join(androidDir, 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
-    if (existsSync(apkPath)) {
-      const size = (readFileSync(apkPath).length / 1024 / 1024).toFixed(1);
-      console.log(`\n${C.green('APK built')} (${size} MB)${isDev ? ' [dev]' : ''}`);
-      console.log(`  ${C.dim(apkPath)}`);
-      console.log(`  Download from server: ${getBaseUrl()}/api/app/download`);
-    }
-  } finally {
-    // Restore original files for dev builds
-    if (isDev && origGradle) {
-      const { writeFileSync } = await import('fs');
-      writeFileSync(buildGradle, origGradle);
-      writeFileSync(stringsXml, origStrings);
-      writeFileSync(manifestXml, origManifest);
-    }
+  const apkPath = join(androidDir, 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
+  if (existsSync(apkPath)) {
+    const size = (readFileSync(apkPath).length / 1024 / 1024).toFixed(1);
+    console.log(`\n${C.green('APK built')} v${newVersion} (${size} MB)`);
+    console.log(`  ${C.dim(apkPath)}`);
+    console.log(`  Download from server: ${getBaseUrl()}/api/app/download`);
   }
 }
 
@@ -415,6 +401,114 @@ async function cmdStart() {
   await new Promise(() => {});
 }
 
+// ── Attach to Session ─────────────────────────────────────
+
+async function cmdAttach(sessionId) {
+  // Fetch sessions
+  const res = await api('/sessions');
+  if (!res.ok) { console.error('Server not reachable'); process.exit(1); }
+  const sessions = await res.json();
+  if (!sessions.length) { console.log(C.dim('No active sessions')); process.exit(0); }
+
+  let session;
+  if (sessionId) {
+    // Match by ID or partial ID or name
+    session = sessions.find(s => s.id === sessionId)
+      || sessions.find(s => s.id.includes(sessionId))
+      || sessions.find(s => s.name?.toLowerCase().includes(sessionId.toLowerCase()));
+    if (!session) { console.error(`No session matching "${sessionId}"`); process.exit(1); }
+  } else if (sessions.length === 1) {
+    session = sessions[0];
+  } else {
+    // Interactive picker
+    console.log(`\n${C.bold('Pick a session to attach:')}\n`);
+    for (let i = 0; i < sessions.length; i++) {
+      const s = sessions[i];
+      const statusColor = s.status === 'working' ? C.green : s.status === 'waiting' ? C.yellow : C.dim;
+      const claude = s.claudeSessionId ? C.dim(` claude:${s.claudeSessionId.slice(0, 8)}`) : '';
+      console.log(`  ${C.bold(String(i + 1))}  ${s.name || 'Unnamed'}  ${statusColor(s.status || 'idle')}  ${C.dim(s.cwd || '')}${claude}`);
+    }
+    console.log();
+    const answer = await prompt('Session number: ');
+    const idx = parseInt(answer) - 1;
+    if (isNaN(idx) || idx < 0 || idx >= sessions.length) { console.error('Invalid selection'); process.exit(1); }
+    session = sessions[idx];
+  }
+
+  console.log(`${C.dim('Attaching to')} ${C.bold(session.name || 'Unnamed')} ${C.dim(`(${session.id})`)}`);
+  console.log(C.dim('Press Ctrl+] to detach\n'));
+
+  // Connect WebSocket
+  const { default: WebSocket } = await import('ws');
+  const token = getToken();
+  const wsUrl = `${getBaseUrl().replace(/^http/, 'ws')}?token=${token}`;
+  const ws = new WebSocket(wsUrl);
+
+  ws.on('open', () => {
+    ws.send(JSON.stringify({ type: 'subscribe', sessionId: session.id }));
+
+    // Get terminal size and send resize
+    const cols = process.stdout.columns || 120;
+    const rows = process.stdout.rows || 40;
+    ws.send(JSON.stringify({ type: 'resize', sessionId: session.id, cols, rows }));
+  });
+
+  ws.on('message', (raw) => {
+    const msg = JSON.parse(raw);
+    if (msg.type === 'output') {
+      process.stdout.write(msg.data);
+    } else if (msg.type === 'session:killed') {
+      console.log(C.dim('\nSession ended.'));
+      cleanup();
+    }
+  });
+
+  ws.on('close', () => {
+    console.log(C.dim('\nDisconnected.'));
+    cleanup();
+  });
+
+  ws.on('error', (err) => {
+    console.error(`WebSocket error: ${err.message}`);
+    cleanup();
+  });
+
+  // Raw mode for stdin
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true);
+  }
+  process.stdin.resume();
+  process.stdin.setEncoding('utf8');
+
+  process.stdin.on('data', (data) => {
+    // Ctrl+] (0x1d) to detach
+    if (data === '\x1d') {
+      console.log(C.dim('\nDetached.'));
+      cleanup();
+      return;
+    }
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'input', sessionId: session.id, data }));
+    }
+  });
+
+  // Handle terminal resize
+  process.stdout.on('resize', () => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'resize', sessionId: session.id, cols: process.stdout.columns, rows: process.stdout.rows }));
+    }
+  });
+
+  function cleanup() {
+    if (process.stdin.isTTY) process.stdin.setRawMode(false);
+    try { ws.close(); } catch {}
+    process.exit(0);
+  }
+
+  // Keep alive
+  await new Promise(() => {});
+}
+
 // ── Setup Hooks ───────────────────────────────────────────
 
 async function cmdSetupHooks() {
@@ -516,6 +610,7 @@ const commands = {
   'check-update':   { fn: cmdCheckUpdate,    desc: 'Check for updates' },
   'apply-update':   { fn: cmdApplyUpdate,    desc: 'Apply available update' },
   'build-apk':      { fn: cmdBuildApk,       desc: 'Build Android APK' },
+  attach:           { fn: () => cmdAttach(args[0]),  desc: 'Attach to a session (interactive picker or pass ID/name)' },
   'setup-hooks':    { fn: cmdSetupHooks,    desc: 'Configure Claude Code hooks for notifications' },
 };
 

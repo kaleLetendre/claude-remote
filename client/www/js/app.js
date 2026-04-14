@@ -13,6 +13,7 @@ const state = {
   connected: false,
   sessions: [],
   activeSessionId: null,
+  activeTabId: null,
   currentView: 'dashboard',
 
   // Settings (persisted to localStorage)
@@ -25,6 +26,7 @@ const state = {
 
   // Runtime
   voiceMode: false,
+  whisperEnabled: false,  // server-side Whisper STT availability (fetched on voice-mode enter)
   voiceRecording: false,
   xterm: null,
   fitAddon: null,
@@ -40,17 +42,16 @@ function loadSettings() {
   const params = new URLSearchParams(location.search);
   if (params.get('token')) {
     state.token = params.get('token');
-    // If we arrived via a full URL with token, save the origin as serverUrl
     state.serverUrl = location.origin;
+    if (params.get('v')) state.appVersion = params.get('v');
     saveSettings();
-    // Clean the URL so token isn't visible in history
     history.replaceState(null, '', location.pathname);
   }
 }
 
 function saveSettings() {
   const keys = [
-    'alertsEnabled', 'alertPrompt', 'alertIdle', 'voiceTalkToggle', 'voiceAutoAccept', 'voiceSpeechRate', 'serverUrl', 'token',
+    'alertsEnabled', 'alertPrompt', 'alertIdle', 'voiceTalkToggle', 'voiceAutoAccept', 'voiceSpeechRate', 'serverUrl', 'token', 'appVersion',
   ];
   const obj = {};
   keys.forEach(k => obj[k] = state[k]);
@@ -133,9 +134,11 @@ function enableMomentumScroll(el, { getScrollPos, setScrollPos }) {
 
 function stripAnsi(str) {
   return str
-    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
-    .replace(/\x1b\][^\x07]*\x07/g, '')
-    .replace(/\x1b[()][AB012]/g, '');
+    .replace(/\x1b\[[\x20-\x3f]*[\x40-\x7e]/g, '')  // CSI sequences
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '') // OSC sequences
+    .replace(/\x1b[()][AB012]/g, '')                   // charset selection
+    .replace(/\x1b[\x20-\x2f]*[\x30-\x7e]/g, '')     // other ESC sequences
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');   // control chars
 }
 
 function shortenPath(p) {
@@ -222,9 +225,16 @@ function loadCachedSessions() {
 }
 
 function saveCachedSessions(sessions) {
+  // Merge so we keep the last-known claudeSessionId for any session that's
+  // currently missing it (e.g. after the server restarted before saving).
+  const prev = new Map(loadCachedSessions().map(s => [s.id, s]));
   const meta = sessions.map(s => ({
-    id: s.id, name: s.name, cwd: s.cwd,
-    createdAt: s.createdAt, lastActivity: s.lastActivity,
+    id: s.id,
+    name: s.name,
+    cwd: s.cwd,
+    createdAt: s.createdAt,
+    lastActivity: s.lastActivity,
+    claudeSessionId: s.claudeSessionId || prev.get(s.id)?.claudeSessionId || null,
   }));
   localStorage.setItem(sessionCacheKey(), JSON.stringify(meta));
 }
@@ -362,17 +372,31 @@ function wsSend(msg) {
 
 function handleWSMessage(msg) {
   switch (msg.type) {
-    case 'sessions':
+    case 'sessions': {
+      const isFirstLoad = state.sessions.length === 0 && msg.data.length > 0;
       state.sessions = mergeWithCache(msg.data);
       if (state.currentView === 'dashboard') renderDashboard();
+      if (state.currentView === 'session') renderTabBar();
       updateTopbarStatus();
+      // On first session list, sync auto-accept state to server
+      if (isFirstLoad && state.voiceAutoAccept) {
+        for (const s of state.sessions) {
+          wsSend({ type: 'autoAccept', sessionId: s.id, enabled: true });
+        }
+      }
       break;
+    }
 
     case 'output':
-      console.log('[ws] output for', msg.sessionId, 'active:', state.activeSessionId, 'match:', msg.sessionId === state.activeSessionId, 'len:', msg.data?.length);
-      if (msg.sessionId === state.activeSessionId) {
+      // Only show output for the active session + active tab
+      if (msg.sessionId === state.activeSessionId && (!msg.tabId || msg.tabId === state.activeTabId)) {
         appendTerminalOutput(msg.data);
-        if (state.voiceMode) parseVoiceOutput(msg.data);
+      }
+      break;
+
+    case 'speak':
+      if (state.voiceMode && msg.sessionId === state.activeSessionId && msg.text) {
+        speakVoice(msg.text);
       }
       break;
 
@@ -380,12 +404,9 @@ function handleWSMessage(msg) {
       // Update session status immediately
       const s = state.sessions.find(s => s.id === msg.sessionId);
       if (s) s.status = msg.reason === 'prompt' ? 'waiting' : 'idle';
-      // Auto-accept: send Enter immediately when prompt appears
-      if (msg.reason === 'prompt' && state.voiceAutoAccept) {
-        wsSend({ type: 'input', sessionId: msg.sessionId, data: '\r' });
-      } else {
-        handleAttention(msg.sessionId, msg.reason, msg.preview);
-      }
+      // Auto-accept is now handled server-side — if we still get an attention event,
+      // it means auto-accept is off for this session, so show the notification
+      handleAttention(msg.sessionId, msg.reason, msg.preview);
       break;
     }
 
@@ -396,12 +417,53 @@ function handleWSMessage(msg) {
       }
       break;
 
+    case 'tab:created':
+      if (msg.sessionId === state.activeSessionId) {
+        // Update session tabs in state, switch to new tab
+        const sess = state.sessions.find(s => s.id === msg.sessionId);
+        if (sess) {
+          if (!sess.tabs) sess.tabs = [];
+          sess.tabs.push(msg.tab);
+        }
+        switchTab(msg.tab.id);
+        renderTabBar();
+      }
+      break;
+
+    case 'tab:killed':
+      if (msg.sessionId === state.activeSessionId) {
+        const sess = state.sessions.find(s => s.id === msg.sessionId);
+        if (sess && sess.tabs) {
+          sess.tabs = sess.tabs.filter(t => t.id !== msg.tabId);
+        }
+        // If the killed tab was active, switch to first available
+        if (state.activeTabId === msg.tabId && sess?.tabs?.length) {
+          switchTab(sess.tabs[0].id);
+        }
+        renderTabBar();
+      }
+      break;
+
+    case 'tab:exit':
+      // A tab's pty exited — update its status in the tab list
+      if (msg.sessionId === state.activeSessionId) {
+        const sess = state.sessions.find(s => s.id === msg.sessionId);
+        if (sess?.tabs) {
+          const tab = sess.tabs.find(t => t.id === msg.tabId);
+          if (tab) tab.alive = false;
+        }
+        renderTabBar();
+      }
+      break;
+
     case 'update:available':
       state.updateInfo = msg.data;
       showUpdateBanner(msg.data);
       break;
 
     case 'subscribed':
+      // Track which tab the server actually subscribed us to
+      if (msg.tabId) state.activeTabId = msg.tabId;
       break;
 
     case 'pong':
@@ -533,6 +595,7 @@ function navigate(view, params = {}) {
       $('#btn-auto-accept')?.classList.add('hidden');
       label.textContent = 'Sessions';
       state.activeSessionId = null;
+      state.activeTabId = null;
       main.appendChild(cloneTemplate('tpl-dashboard'));
       initDashboard();
       break;
@@ -708,7 +771,11 @@ function renderSessionCard(s) {
   } else if (s.status === 'dead') {
     const openSession = async () => {
       try {
-        await api.post(`/api/sessions/${s.id}/reconnect`);
+        // Pass the cached claudeSessionId so revive works even if the server
+        // lost it (e.g. restarted before the hook save landed).
+        const cached = loadCachedSessions().find(c => c.id === s.id);
+        const claudeSessionId = s.claudeSessionId || cached?.claudeSessionId || null;
+        await api.post(`/api/sessions/${s.id}/reconnect`, { resumeClaude: true, claudeSessionId });
         navigate('session', { id: s.id, name: s.name });
       } catch (err) {
         console.error('Reconnect failed:', err);
@@ -718,6 +785,7 @@ function renderSessionCard(s) {
       if (e.target.closest('.card-btn')) return;
       openSession();
     };
+    $('.card-btn-open', card).textContent = 'Revive';
     $('.card-btn-open', card).onclick = openSession;
   } else {
     card.onclick = (e) => {
@@ -924,12 +992,33 @@ function formatSize(bytes) {
 // ── Session / Terminal View ─────────────────────────────────
 
 function initSessionView(sessionId) {
-  // Subscribe to session output
-  console.log('[session] subscribing to', sessionId);
-  wsSend({ type: 'subscribe', sessionId });
+  // Determine initial tab
+  const sess = state.sessions.find(s => s.id === sessionId);
+  const tabs = sess?.tabs || [{ id: 'main', name: 'Terminal', alive: true }];
+  state.activeTabId = tabs[0]?.id || 'main';
+
+  // Subscribe to session output (first tab)
+  console.log('[session] subscribing to', sessionId, 'tab', state.activeTabId);
+  wsSend({ type: 'subscribe', sessionId, tabId: state.activeTabId });
+
+  // Sync auto-accept state to server
+  if (state.voiceAutoAccept) {
+    wsSend({ type: 'autoAccept', sessionId, enabled: true });
+  }
 
   // Init xterm.js
   initTerminal();
+
+  // Render tab bar
+  renderTabBar();
+
+  // Tab add button
+  const addBtn = $('#tab-add-btn');
+  if (addBtn) {
+    addBtn.onclick = () => {
+      wsSend({ type: 'createTab', sessionId: state.activeSessionId });
+    };
+  }
 
   // Jump to bottom button — use touchstart/mousedown + preventDefault to avoid stealing focus
   const jumpBtn = $('#jump-bottom-btn');
@@ -943,15 +1032,15 @@ function initSessionView(sessionId) {
     btn.onclick = () => {
       const raw = btn.dataset.cmd;
       if (!raw) return;
-      // If data ends with \r (Enter), split text from Enter with a delay
+      const tabId = state.activeTabId;
       if (raw.length > 1 && raw.endsWith('\r')) {
         const text = raw.slice(0, -1);
-        wsSend({ type: 'input', sessionId, data: text });
+        wsSend({ type: 'input', sessionId, tabId, data: text });
         setTimeout(() => {
-          wsSend({ type: 'input', sessionId, data: '\r' });
+          wsSend({ type: 'input', sessionId, tabId, data: '\r' });
         }, 150);
       } else {
-        wsSend({ type: 'input', sessionId, data: raw });
+        wsSend({ type: 'input', sessionId, tabId, data: raw });
       }
       dismissAttention();
     };
@@ -968,15 +1057,13 @@ function initSessionView(sessionId) {
       .replace(/\u2013/g, '-')    // en dash → -
       .replace(/\u2018|\u2019/g, "'")  // smart single quotes
       .replace(/\u201C|\u201D/g, '"'); // smart double quotes
+    const tabId = state.activeTabId;
     if (!val && !val.trim()) {
-      // Empty input — just send Enter
-      wsSend({ type: 'input', sessionId, data: '\r' });
+      wsSend({ type: 'input', sessionId, tabId, data: '\r' });
     } else {
-      // Send text first, then Enter after a short delay
-      // Claude Code's TUI input needs this separation
-      wsSend({ type: 'input', sessionId, data: val });
+      wsSend({ type: 'input', sessionId, tabId, data: val });
       setTimeout(() => {
-        wsSend({ type: 'input', sessionId, data: '\r' });
+        wsSend({ type: 'input', sessionId, tabId, data: '\r' });
       }, 150);
     }
     cmdInput.value = '';
@@ -1001,40 +1088,75 @@ function initSessionView(sessionId) {
     btn.onclick = () => {
       const cmd = btn.dataset.cmd;
       if (cmd && state.activeSessionId) {
-        wsSend({ type: 'input', sessionId: state.activeSessionId, data: cmd });
+        wsSend({ type: 'input', sessionId: state.activeSessionId, tabId: state.activeTabId, data: cmd });
       }
     };
   });
 
-  // Auto-accept toggle
-  const autoBtn = $('#voice-auto-accept');
-  if (autoBtn) {
-    if (state.voiceAutoAccept) autoBtn.classList.add('active');
-    autoBtn.onclick = () => {
-      state.voiceAutoAccept = !state.voiceAutoAccept;
-      autoBtn.classList.toggle('active', state.voiceAutoAccept);
-      saveSettings();
-    };
-  }
-
-  // Voice speech rate controls
-  const rateLabel = $('#voice-rate-label');
-  if (rateLabel) rateLabel.textContent = (state.voiceSpeechRate || 1.1).toFixed(1) + 'x';
-  const rateDown = $('#voice-rate-down');
-  const rateUp = $('#voice-rate-up');
-  if (rateDown) rateDown.onclick = () => {
-    state.voiceSpeechRate = Math.max(0.5, (state.voiceSpeechRate || 1.1) - 0.1);
-    if (rateLabel) rateLabel.textContent = state.voiceSpeechRate.toFixed(1) + 'x';
-    saveSettings();
-  };
-  if (rateUp) rateUp.onclick = () => {
-    state.voiceSpeechRate = Math.min(3.0, (state.voiceSpeechRate || 1.1) + 0.1);
-    if (rateLabel) rateLabel.textContent = state.voiceSpeechRate.toFixed(1) + 'x';
-    saveSettings();
-  };
-
   // Restore voice mode if it was active
   if (state.voiceMode) applyVoiceMode(true);
+}
+
+function renderTabBar() {
+  const tabBar = $('#tab-bar');
+  const tabList = $('#tab-list');
+  if (!tabBar || !tabList) return;
+
+  const sess = state.sessions.find(s => s.id === state.activeSessionId);
+  const tabs = sess?.tabs || [];
+
+  tabList.innerHTML = '';
+
+  // Only show tab items when there's more than 1 tab
+  if (tabs.length <= 1) return;
+  for (const tab of tabs) {
+    const el = document.createElement('button');
+    el.className = 'tab-item' + (tab.id === state.activeTabId ? ' active' : '');
+    el.dataset.tabId = tab.id;
+
+    const label = document.createElement('span');
+    label.textContent = tab.name + (tab.alive === false ? ' (dead)' : '');
+    el.appendChild(label);
+
+    // Close button (don't show if it's the only tab)
+    if (tabs.length > 1) {
+      const close = document.createElement('button');
+      close.className = 'tab-close';
+      close.textContent = '\u00d7';
+      close.onclick = (e) => {
+        e.stopPropagation();
+        wsSend({ type: 'killTab', sessionId: state.activeSessionId, tabId: tab.id });
+      };
+      el.appendChild(close);
+    }
+
+    el.onclick = () => {
+      if (tab.id !== state.activeTabId) switchTab(tab.id);
+    };
+
+    tabList.appendChild(el);
+  }
+}
+
+function switchTab(tabId) {
+  if (tabId === state.activeTabId) return;
+
+  // Unsubscribe from current tab, subscribe to new one
+  state.activeTabId = tabId;
+  destroyTerminal();
+  initTerminal();
+  wsSend({ type: 'subscribe', sessionId: state.activeSessionId, tabId });
+  renderTabBar();
+}
+
+// Fetches the server's voice status so we know whether to record audio for Whisper.
+async function refreshWhisperStatus() {
+  try {
+    const res = await api.get('/api/voice/status');
+    state.whisperEnabled = !!res.whisperEnabled;
+  } catch {
+    state.whisperEnabled = false;
+  }
 }
 
 function applyVoiceMode(on) {
@@ -1045,6 +1167,7 @@ function applyVoiceMode(on) {
   const talkBtn = $('#voice-talk-btn');
 
   if (on) {
+    refreshWhisperStatus();  // fire-and-forget — sets state.whisperEnabled
     quickBar?.classList.add('hidden');
     inputBar?.classList.add('hidden');
     overlay?.classList.remove('hidden');
@@ -1072,8 +1195,8 @@ function applyVoiceMode(on) {
     }
   } else {
     if (state.voiceRecording) stopVoiceRecording();
-    if ('speechSynthesis' in window) speechSynthesis.cancel();
-    _voiceOutputBuffer = '';
+    if (window.NativeBridge?.stopSpeaking) window.NativeBridge.stopSpeaking();
+    else if ('speechSynthesis' in window) speechSynthesis.cancel();
     quickBar?.classList.remove('hidden');
     inputBar?.classList.remove('hidden');
     overlay?.classList.add('hidden');
@@ -1094,12 +1217,6 @@ function applyVoiceMode(on) {
 function toggleVoiceMode() {
   state.voiceMode = !state.voiceMode;
   applyVoiceMode(state.voiceMode);
-  // Warm up speechSynthesis with a silent utterance (Android requires user gesture)
-  if (state.voiceMode && 'speechSynthesis' in window) {
-    const warmup = new SpeechSynthesisUtterance('');
-    warmup.volume = 0;
-    speechSynthesis.speak(warmup);
-  }
 }
 
 // ── Voice Recording (STT + Waveform) ───────────────────────
@@ -1112,6 +1229,8 @@ let _voiceAnalyser = null;
 let _voiceTranscriptParts = [];
 let _voiceCurrentInterim = '';
 let _voicePendingStop = false;
+let _voiceMediaRecorder = null;   // parallel audio capture for server-side Whisper
+let _voiceMediaChunks = [];
 let _voiceHasFinal = false;
 let _voiceLastActivity = 0;
 let _voiceAudioActive = false;
@@ -1119,9 +1238,11 @@ let _voiceAudioActive = false;
 async function startVoiceRecording() {
   if (state.voiceRecording) return;
   // Interrupt TTS if speaking
-  if ('speechSynthesis' in window) speechSynthesis.cancel();
+  if (window.parent !== window) window.parent.postMessage({ type: 'stop-speaking' }, '*');
+  else if ('speechSynthesis' in window) speechSynthesis.cancel();
 
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const useWhisper = !!state.whisperEnabled;
   if (!SR) {
     const el = $('#voice-you');
     if (el) el.textContent = 'Speech recognition not supported';
@@ -1136,7 +1257,9 @@ async function startVoiceRecording() {
   const youEl = $('#voice-you');
   if (youEl) youEl.textContent = '';
 
-  // Speech recognition
+  // Always run Android SpeechRecognition — gives us the live waveform cues
+  // and a reliable transcript on its own. Whisper runs in parallel (below)
+  // and, when it succeeds, replaces the transcript on release.
   _voiceRecog = new SR();
   _voiceRecog.continuous = false;
   _voiceRecog.interimResults = true;
@@ -1164,13 +1287,11 @@ async function startVoiceRecording() {
   };
 
   _voiceRecog.onend = () => {
-    // If waiting for final result, it should have arrived by now — finish up
     if (_voicePendingStop) {
       _voicePendingStop = false;
       finishVoiceRecording();
       return;
     }
-    // Keep listening until explicitly stopped (button release or toggle tap)
     if (state.voiceRecording && _voiceRecog) {
       try { _voiceRecog.start(); } catch {}
     }
@@ -1195,7 +1316,7 @@ async function startVoiceRecording() {
   _voiceAudioActive = false;
   $('#voice-talk-btn')?.classList.add('recording');
 
-  // Try to get real audio levels for waveform
+  // Open mic for waveform and (when enabled) server-side Whisper capture.
   try {
     if (navigator.mediaDevices?.getUserMedia) {
       _voiceStream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -1204,8 +1325,42 @@ async function startVoiceRecording() {
       _voiceAnalyser = _voiceAudioCtx.createAnalyser();
       _voiceAnalyser.fftSize = 64;
       source.connect(_voiceAnalyser);
+
+      // Server-side Whisper path — only when Whisper is enabled.
+      // Tee the audio through an AudioContext MediaStreamDestination so the
+      // MediaRecorder operates on a derived stream, not the raw mic stream.
+      // This keeps the AnalyserNode (waveform) working on Android, where
+      // MediaRecorder otherwise takes exclusive access to the raw mic.
+      if (useWhisper && typeof MediaRecorder !== 'undefined') {
+        try {
+          const dest = _voiceAudioCtx.createMediaStreamDestination();
+          source.connect(dest);
+          const recStream = dest.stream;
+
+          _voiceMediaChunks = [];
+          // Let the browser pick a default MIME — isTypeSupported lies on some WebViews.
+          try {
+            _voiceMediaRecorder = new MediaRecorder(recStream);
+          } catch {
+            _voiceMediaRecorder = new MediaRecorder(recStream, { mimeType: 'audio/webm' });
+          }
+          _voiceMediaRecorder.ondataavailable = (e) => {
+            if (e.data && e.data.size > 0) _voiceMediaChunks.push(e.data);
+          };
+          _voiceMediaRecorder.onerror = (e) => {
+            console.warn('[whisper] MediaRecorder error:', e.error?.message || e);
+          };
+          _voiceMediaRecorder.start();
+          console.log('[whisper] MediaRecorder started, state=', _voiceMediaRecorder.state, 'mime=', _voiceMediaRecorder.mimeType);
+        } catch (e) {
+          console.warn('[whisper] MediaRecorder failed:', e.message);
+          _voiceMediaRecorder = null;
+        }
+      }
     }
-  } catch {}
+  } catch (e) {
+    console.warn('[voice] getUserMedia failed:', e.message);
+  }
 
   renderWaveform();
 }
@@ -1230,12 +1385,15 @@ function stopVoiceRecording() {
   }
 }
 
-function finishVoiceRecording() {
+async function finishVoiceRecording() {
   // Stop recognition
   if (_voiceRecog) {
     try { _voiceRecog.stop(); } catch {}
     _voiceRecog = null;
   }
+
+  // Capture whatever the MediaRecorder produced for Whisper (if any)
+  const mediaBlob = await _finalizeMediaRecorder();
 
   // Stop mic/audio
   if (_voiceStream) {
@@ -1255,17 +1413,59 @@ function finishVoiceRecording() {
   }
   clearWaveform();
 
+  // Server-side Whisper: try to replace transcript with higher-accuracy version.
+  // Any failure falls through silently to the Android STT result below.
+  if (mediaBlob && state.whisperEnabled) {
+    try {
+      const whisperText = await transcribeWithWhisper(mediaBlob, 2500);
+      if (whisperText && whisperText.trim()) {
+        _voiceTranscriptParts = [whisperText.trim()];
+        _voiceCurrentInterim = '';
+      }
+    } catch (e) {
+      console.warn('[whisper] transcribe failed, using Android STT:', e.message);
+    }
+  }
+
   // Send transcript to terminal
   const parts = [..._voiceTranscriptParts];
   if (_voiceCurrentInterim) parts.push(_voiceCurrentInterim);
   const text = parts.join(' ').trim();
   if (text && state.activeSessionId) {
+    // Hands-free slash commands: "system command clear" → `/clear`
+    const voiceCmd = tryParseVoiceCommand(text);
+    if (voiceCmd) {
+      // Intercepted command — speak guidance, send nothing.
+      if (voiceCmd.speak) {
+        speakVoice(voiceCmd.speak);
+        return;
+      }
+
+      const sid = state.activeSessionId;
+      wsSend({ type: 'input', sessionId: sid, data: voiceCmd.ptyInput });
+      if (!voiceCmd.ptyInput.startsWith('\x03')) {
+        setTimeout(() => wsSend({ type: 'input', sessionId: sid, data: '\r' }), 50);
+      }
+
+      // Informational commands (cost, status, etc.): fire a follow-up prompt so
+      // Claude summarizes the slash command's output via speak. Claude Code bundles
+      // the slash command's stdout into the next user turn.
+      if (voiceCmd.interpret) {
+        setTimeout(() => {
+          const followUp = `[Voice mode. The slash command output is visible above in this turn as local-command-stdout. Summarize the result in one short natural sentence and call the shell command: speak "your one-sentence summary". Do not print any other text or duplicate the summary.]`;
+          wsSend({ type: 'input', sessionId: sid, data: followUp });
+          setTimeout(() => wsSend({ type: 'input', sessionId: sid, data: '\r' }), 50);
+        }, 700);
+      }
+      return;
+    }
+
     const session = state.sessions.find(s => s.id === state.activeSessionId);
     const isWaiting = session?.status === 'waiting';
 
     // In voice mode, wrap with instruction prefix (skip if answering a prompt)
     const toSend = (state.voiceMode && !isWaiting)
-      ? `[Voice mode. Do your work normally — edit files, run commands, etc. After completing your work, put your spoken summary between two lines that each contain only the text tilde-SPEAK-tilde. Keep the summary concise — it will be read aloud via TTS. Everything outside those marker lines stays in the terminal only.]\n\n${text}`
+      ? `[Voice mode. Do your work normally — edit files, run commands, etc. After completing your work, run the shell command: speak "your concise spoken summary here". That text will be read aloud via TTS on the phone. Do not duplicate the summary in your text output.]\n\n${text}`
       : text;
 
     wsSend({ type: 'input', sessionId: state.activeSessionId, data: toSend });
@@ -1273,6 +1473,110 @@ function finishVoiceRecording() {
       wsSend({ type: 'input', sessionId: state.activeSessionId, data: '\r' });
     }, 150);
   }
+}
+
+// Stops the MediaRecorder (if running) and returns the final Blob, or null.
+function _finalizeMediaRecorder() {
+  return new Promise((resolve) => {
+    const mr = _voiceMediaRecorder;
+    _voiceMediaRecorder = null;
+    if (!mr || mr.state === 'inactive') {
+      const chunks = _voiceMediaChunks;
+      _voiceMediaChunks = [];
+      if (!chunks.length) return resolve(null);
+      resolve(new Blob(chunks, { type: chunks[0].type || 'audio/webm' }));
+      return;
+    }
+    const timer = setTimeout(() => resolve(null), 1000);
+    mr.onstop = () => {
+      clearTimeout(timer);
+      const chunks = _voiceMediaChunks;
+      _voiceMediaChunks = [];
+      if (!chunks.length) return resolve(null);
+      resolve(new Blob(chunks, { type: chunks[0].type || 'audio/webm' }));
+    };
+    try { mr.stop(); } catch { resolve(null); }
+  });
+}
+
+// POSTs audio to the server's Whisper endpoint. Returns transcribed text.
+// Uses AbortController for timeout so a hanging server never blocks voice.
+async function transcribeWithWhisper(blob, timeoutMs = 2500) {
+  const buf = await blob.arrayBuffer();
+  const b64 = _bufToBase64(buf);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const base = api.baseUrl;
+    const url = `${base}/api/voice/transcribe?token=${encodeURIComponent(state.token)}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${state.token}` },
+      body: JSON.stringify({ audio_b64: b64, language: 'en' }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    return data.text || '';
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function _bufToBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  let s = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    s += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(s);
+}
+
+// Translate a hands-free voice phrase into raw pty input.
+// "system command <rest>" → `/<rest>`, sent raw to Claude Code's TUI.
+// Special case: stop/cancel/abort → Ctrl+C (not a slash command).
+// Returns one of:
+//   null — not a command, fall through to normal voice flow
+//   { speak } — intercept: speak the message, do not send anything to the pty
+//   { ptyInput, interpret } — send to pty; interpret=true fires a summary follow-up
+function tryParseVoiceCommand(text) {
+  const m = text.match(/^\s*system\s+commands?\s*[,.:]?\s*(.+?)\s*$/i);
+  if (!m) return null;
+  const rest = m[1].toLowerCase().replace(/[.!?]+$/, '').trim();
+  if (!rest) return { speak: 'No command given. Say system command followed by a command name.' };
+
+  // Cancel the current generation — not a slash command, no follow-up (user is stopping me).
+  if (/^(stop|cancel|abort|escape)\b/.test(rest)) return { ptyInput: '\x03', interpret: false };
+
+  const firstWord = rest.split(/\s+/)[0];
+  const hasArgs = /\s/.test(rest);
+
+  // Commands that open interactive pickers / menus that voice can't navigate.
+  // Intercept and tell the user what to do instead.
+  const interactiveGuides = {
+    help: 'The help command opens an interactive dialog. Just ask me directly what you want to know.',
+    model: hasArgs ? null : 'Specify the model: system command model opus, sonnet, or haiku.',
+    agents: 'Agents opens a picker. Ask me in normal voice which agents you want to know about.',
+    config: 'Config opens a menu. Ask me in normal voice what you want to change.',
+    resume: 'Resume opens a session picker. Use the revive button on the dashboard instead.',
+    permissions: 'Permissions opens a menu. Ask me in normal voice to adjust specific rules.',
+    mcp: 'MCP opens a picker. Ask me in normal voice about your MCP servers.',
+    hooks: 'Hooks opens a menu. Ask me in normal voice about your hooks configuration.',
+    'output-style': 'Output style opens a picker. Ask me in normal voice which style you want.',
+    ide: 'IDE opens a picker. Not useful via voice.',
+    vim: 'Vim mode toggle — not useful via voice.',
+    login: 'Login requires a browser flow. Use the admin panel.',
+    logout: 'Logout is a destructive action. Run it from the admin panel to avoid mistakes.',
+  };
+  const guide = interactiveGuides[firstWord];
+  if (guide) return { speak: guide };
+
+  // Commands that wipe or rewrite context — skip follow-up to avoid wasting a turn on confirmation.
+  const skipInterpret = new Set(['clear', 'compact', 'exit', 'quit', 'init']);
+  const interpret = !skipInterpret.has(firstWord);
+
+  return { ptyInput: '/' + rest, interpret };
 }
 
 function renderWaveform() {
@@ -1339,67 +1643,32 @@ function clearWaveform() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 }
 
-// ── Voice Output Parser + TTS ───────────────────────────────
-
-let _voiceOutputBuffer = '';
-
-function parseVoiceOutput(data) {
-  _voiceOutputBuffer += stripAnsi(data);
-
-  // Prevent memory leak
-  if (_voiceOutputBuffer.length > 50000) {
-    _voiceOutputBuffer = _voiceOutputBuffer.slice(-10000);
-  }
-
-  // Look for ~SPEAK~ markers (use regex to handle whitespace variations)
-  const markerRe = /~\s*SPEAK\s*~/g;
-  const matches = [..._voiceOutputBuffer.matchAll(markerRe)];
-  if (matches.length < 2) return;
-
-  // Extract text between first two markers
-  const startIdx = matches[0].index + matches[0][0].length;
-  const endIdx = matches[1].index;
-  const voiceText = _voiceOutputBuffer.slice(startIdx, endIdx).trim();
-  _voiceOutputBuffer = _voiceOutputBuffer.slice(matches[1].index + matches[1][0].length);
-
-  if (voiceText) {
-    console.log('[voice] parsed voice text:', voiceText.slice(0, 100));
-    speakVoice(voiceText);
-  }
-}
+// ── Voice TTS ───────────────────────────────
 
 function speakVoice(text) {
-  if (!('speechSynthesis' in window)) {
-    console.log('[voice] speechSynthesis not available');
+  console.log('[voice] speaking:', text.slice(0, 80));
+
+  // Use native Android TTS via postMessage to bootstrap (which has NativeBridge)
+  if (window.parent !== window) {
+    window.parent.postMessage({ type: 'speak', text }, '*');
     return;
   }
 
-  console.log('[voice] speaking:', text.slice(0, 80));
+  // Fallback to Web Speech API (requires HTTPS)
+  if (!('speechSynthesis' in window)) return;
 
-  // Split into sentences for natural pacing
   const sentences = text
     .split(/(?<=[.!?])\s+|\n+/)
     .map(s => s.trim())
     .filter(s => s.length > 0);
 
   if (sentences.length === 0) return;
-
   speechSynthesis.cancel();
 
-  const last = sentences.length - 1;
   sentences.forEach((sentence, i) => {
     const utt = new SpeechSynthesisUtterance(sentence);
     utt.rate = state.voiceSpeechRate || 1.1;
-    utt.pitch = 1.0;
-    utt.volume = 1.0;
-
-    utt.onerror = (e) => console.log('[voice] TTS error:', e.error);
-
-    // Play chime when all utterances finish
-    if (i === last) {
-      utt.onend = () => playChime('idle');
-    }
-
+    if (i === sentences.length - 1) utt.onend = () => playChime('idle');
     speechSynthesis.speak(utt);
   });
 }
@@ -1453,6 +1722,7 @@ function initTerminal() {
     wsSend({
       type: 'resize',
       sessionId: state.activeSessionId,
+      tabId: state.activeTabId,
       cols: term.cols,
       rows: term.rows,
     });
@@ -1890,7 +2160,7 @@ function initSettings() {
   if (appBtn) {
     // Show current app version (from URL param set by bootstrap)
     const params = new URLSearchParams(location.search);
-    const clientVersion = params.get('v') || 'unknown';
+    const clientVersion = state.appVersion || params.get('v') || 'unknown';
     const appVersionEl = $('#setting-app-version');
     if (appVersionEl) appVersionEl.textContent = `v${clientVersion}`;
 
@@ -1901,7 +2171,20 @@ function initSettings() {
       try {
         const res = await fetch(`${api.baseUrl}/api/app/version`);
         const data = await res.json();
-        if (data.version && data.version !== clientVersion) {
+        if (clientVersion === 'unknown') {
+          statusEl.textContent = 'Version unknown — reinstall APK to detect';
+          statusEl.style.color = 'var(--amber)';
+          appBtn.textContent = 'Download';
+          appBtn.disabled = false;
+          appBtn.onclick = () => {
+            const url = `${api.baseUrl}/api/app/download`;
+            if (window.parent !== window) {
+              window.parent.postMessage({ type: 'download-apk', url }, '*');
+            } else {
+              window.open(url, '_blank');
+            }
+          };
+        } else if (data.version && data.version !== clientVersion) {
           statusEl.textContent = `${clientVersion} → ${data.version}`;
           statusEl.style.color = 'var(--accent)';
           appBtn.textContent = 'Download';
@@ -1955,8 +2238,11 @@ $('#btn-voice-mode').onclick = toggleVoiceMode;
 $('#btn-auto-accept').onclick = () => {
   state.voiceAutoAccept = !state.voiceAutoAccept;
   $('#btn-auto-accept')?.classList.toggle('active', state.voiceAutoAccept);
-  $('#voice-auto-accept')?.classList.toggle('active', state.voiceAutoAccept);
   saveSettings();
+  // Sync auto-accept state to server for all sessions
+  for (const s of state.sessions) {
+    wsSend({ type: 'autoAccept', sessionId: s.id, enabled: state.voiceAutoAccept });
+  }
 };
 
 // Android back button — intercept via popstate

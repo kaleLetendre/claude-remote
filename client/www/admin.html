@@ -61,12 +61,18 @@
     .client-row .ip { color: var(--text-0); }
     .client-row .meta { color: var(--text-3); font-size: 12px; }
 
-    .session-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; background: var(--bg-2); border-radius: 6px; margin-bottom: 6px; }
+    .session-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; background: var(--bg-2); border-radius: 6px; margin-bottom: 6px; gap: 8px; }
+    .session-info { flex: 1; min-width: 0; }
     .session-name { font-weight: 600; font-size: 14px; }
+    .session-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
     .session-status { font-family: var(--font-mono); font-size: 12px; padding: 2px 8px; border-radius: 10px; }
+    .btn-open { background: var(--accent-bg); color: var(--accent); border: 1px solid var(--accent-border); border-radius: 6px; padding: 5px 12px; font-size: 12px; font-weight: 600; cursor: pointer; font-family: var(--font-ui); white-space: nowrap; }
+    .btn-open:hover { background: var(--accent); color: #fff; }
     .session-status.working { background: var(--green-bg); color: var(--green); }
     .session-status.idle { background: var(--bg-3); color: var(--text-2); }
     .session-status.waiting { background: rgba(240,192,80,0.1); color: var(--amber); }
+    .session-status.dead { background: var(--red-bg); color: var(--red); }
+    .session-status.done { background: var(--bg-3); color: var(--text-3); }
 
     .controls { display: flex; gap: 8px; flex-wrap: wrap; }
 
@@ -195,16 +201,9 @@
           el('client-count').textContent = d.clients?.length || 0;
         }
         if (el('session-list')) {
-          el('session-list').innerHTML = (d.sessions && d.sessions.length) ? d.sessions.map(s => `
-            <div class="session-row">
-              <div>
-                <div class="session-name">${s.name || 'Unnamed'}</div>
-                <div style="font-size:12px;color:var(--text-3);font-family:var(--font-mono);">${s.cwd || ''}</div>
-              </div>
-              <span class="session-status ${s.status || 'idle'}">${s.status || 'idle'}</span>
-            </div>
-          `).join('') : '<div class="empty">No active sessions</div>';
+          el('session-list').innerHTML = (d.sessions && d.sessions.length) ? d.sessions.map(s => renderSessionRow(s)).join('') : '<div class="empty">No active sessions</div>';
           el('session-count').textContent = d.sessions?.length || 0;
+          wireOpenButtons();
         }
         if (el('pw-status')) {
           el('pw-status').innerHTML = d.passwordSet ? '<span style="color:var(--green);">(set)</span>' : '<span style="color:var(--text-3);">(not set)</span>';
@@ -250,6 +249,12 @@
           <p class="msg" id="pw-msg"></p>
         </div>
 
+        <!-- Whisper (Server-side STT) -->
+        <div class="card" id="whisper-card">
+          <h2>Whisper (Server STT)</h2>
+          <div id="whisper-body"><div class="empty">Loading…</div></div>
+        </div>
+
         <!-- Connected Clients -->
         <div class="card">
           <h2>Connected Clients (<span id="client-count">${d.clients?.length || 0}</span>)</h2>
@@ -266,15 +271,7 @@
         <!-- Sessions -->
         <div class="card">
           <h2>Sessions (<span id="session-count">${d.sessions?.length || 0}</span>)</h2>
-          <div id="session-list">${(d.sessions && d.sessions.length) ? d.sessions.map(s => `
-            <div class="session-row">
-              <div>
-                <div class="session-name">${s.name || 'Unnamed'}</div>
-                <div style="font-size:12px;color:var(--text-3);font-family:var(--font-mono);">${s.cwd || ''}</div>
-              </div>
-              <span class="session-status ${s.status || 'idle'}">${s.status || 'idle'}</span>
-            </div>
-          `).join('') : '<div class="empty">No active sessions</div>'}</div>
+          <div id="session-list">${(d.sessions && d.sessions.length) ? d.sessions.map(s => renderSessionRow(s)).join('') : '<div class="empty">No active sessions</div>'}</div>
         </div>
 
         <!-- Controls -->
@@ -283,6 +280,7 @@
           <div class="controls">
             <button class="btn btn-secondary" id="btn-restart">Restart Server</button>
             <button class="btn btn-secondary" id="btn-check-update">Check for Updates</button>
+            <button class="btn btn-secondary" id="btn-reload-ui">Hard Reload UI</button>
           </div>
           <p class="msg" id="ctrl-msg"></p>
         </div>
@@ -331,6 +329,13 @@
         } catch (e) { msg.className = 'msg err'; msg.textContent = e.message; }
       };
 
+      document.getElementById('btn-reload-ui').onclick = () => {
+        // Append a cache-buster and reload so even aggressive webview caching is bypassed.
+        const u = new URL(location.href);
+        u.searchParams.set('t', String(Date.now()));
+        location.replace(u.toString());
+      };
+
       document.getElementById('btn-check-update').onclick = async () => {
         const msg = document.getElementById('ctrl-msg');
         try {
@@ -340,6 +345,258 @@
           msg.textContent = data.updateAvailable ? `Update available: ${data.details?.version}` : 'Already up to date';
         } catch (e) { msg.className = 'msg err'; msg.textContent = e.message; }
       };
+
+      wireOpenButtons();
+
+      // Load Whisper panel
+      refreshWhisperPanel();
+    }
+
+    // ── Whisper admin panel ──────────────────────────────────
+    async function refreshWhisperPanel() {
+      const body = document.getElementById('whisper-body');
+      if (!body) return;
+      try {
+        const res = await api('/admin/whisper/status');
+        const w = await res.json();
+        body.innerHTML = renderWhisperBody(w);
+        wireWhisperHandlers(w);
+      } catch (e) {
+        body.innerHTML = `<div class="msg err">Failed to load: ${e.message}</div>`;
+      }
+    }
+
+    function fmtBytes(n) {
+      if (n < 1024) return n + ' B';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+      if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+      return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+    }
+
+    function renderWhisperBody(w) {
+      const badge = (ok, label) => `<span class="stat-value" style="color:${ok ? 'var(--green)' : 'var(--red)'}">${ok ? '✓' : '✗'} ${label}</span>`;
+      const running = w.running
+        ? `<span style="color:var(--green);font-family:var(--font-mono);font-size:13px">running: model=${w.currentConfig?.model} device=${w.currentConfig?.device}</span>`
+        : `<span style="color:var(--text-3);font-family:var(--font-mono);font-size:13px">not running</span>`;
+
+      const installed = w.installedModels.length
+        ? w.installedModels.map(m => `
+            <div class="session-row">
+              <div class="session-info">
+                <div class="session-name">${m.name}</div>
+                <div style="font-size:12px;color:var(--text-3);font-family:var(--font-mono)">${fmtBytes(m.sizeBytes)}</div>
+              </div>
+              <div class="session-right">
+                <button class="btn btn-danger btn-sm" data-delete-model="${m.name}">Delete</button>
+              </div>
+            </div>`).join('')
+        : '<div class="empty">No models installed</div>';
+
+      const missingModelsList = w.knownModels.filter(m => !w.installedModels.some(x => x.name === m));
+
+      const modelOptions = w.installedModels.map(m =>
+        `<option value="${m.name}"${m.name === w.model ? ' selected' : ''}>${m.name}</option>`
+      ).join('');
+
+      const deviceOptions = `
+        <label style="margin-right:12px;color:var(--text-1);font-size:13px">
+          <input type="radio" name="whisper-device" value="auto" ${w.device === 'auto' ? 'checked' : ''}> auto
+        </label>
+        <label style="margin-right:12px;color:var(--text-1);font-size:13px">
+          <input type="radio" name="whisper-device" value="cpu" ${w.device === 'cpu' ? 'checked' : ''}> CPU
+        </label>
+        <label style="color:${w.cudaAvailable ? 'var(--text-1)' : 'var(--text-3)'};font-size:13px">
+          <input type="radio" name="whisper-device" value="cuda" ${w.device === 'cuda' ? 'checked' : ''} ${w.cudaAvailable ? '' : 'disabled'}>
+          GPU (CUDA)${w.cudaAvailable ? '' : ' — not detected'}
+        </label>`;
+
+      const bootstrapSection = w.fasterWhisperInstalled
+        ? `<div class="msg ok">faster-whisper ready</div>`
+        : `<div class="stat" style="margin-top:8px">
+             <div class="stat-label">Setup required</div>
+             <div style="font-size:13px;color:var(--text-1);margin-bottom:8px">
+               ${!w.pythonAvailable ? '<span style="color:var(--red)">Python 3 not found on PATH.</span><br>Install python3 on the server host, then reload this page.' : 'Install faster-whisper into a managed venv under data/whisper-venv. Takes a minute.'}
+             </div>
+             <button class="btn btn-primary btn-sm" id="whisper-bootstrap-btn" ${w.pythonAvailable ? '' : 'disabled'}>Install Whisper dependencies</button>
+             <pre id="whisper-bootstrap-log" style="display:none;margin-top:8px;padding:8px;background:var(--bg-2);border-radius:6px;max-height:200px;overflow:auto;font-size:11px;color:var(--text-1);font-family:var(--font-mono)"></pre>
+           </div>`;
+
+      return `
+        <div class="stat-grid" style="margin-bottom:12px">
+          <div class="stat"><div class="stat-label">Python 3</div><div class="stat-value">${w.pythonAvailable ? '<span style="color:var(--green)">✓ available</span>' : '<span style="color:var(--red)">✗ not found</span>'}</div></div>
+          <div class="stat"><div class="stat-label">CUDA</div><div class="stat-value">${w.cudaAvailable ? '<span style="color:var(--green)">✓ detected</span>' : '<span style="color:var(--text-3)">not detected</span>'}</div></div>
+          <div class="stat"><div class="stat-label">ffmpeg</div><div class="stat-value">${w.ffmpegAvailable ? '<span style="color:var(--green)">✓ available</span>' : '<span style="color:var(--amber)">not found (needed for audio decode)</span>'}</div></div>
+          <div class="stat"><div class="stat-label">faster-whisper</div><div class="stat-value">${w.fasterWhisperInstalled ? '<span style="color:var(--green)">✓ installed</span>' : '<span style="color:var(--text-3)">not installed</span>'}</div></div>
+        </div>
+
+        ${bootstrapSection}
+
+        <label class="field-label">Enabled</label>
+        <label style="display:flex;align-items:center;gap:8px">
+          <input type="checkbox" id="whisper-enabled" ${w.enabled ? 'checked' : ''} ${w.fasterWhisperInstalled ? '' : 'disabled'}>
+          <span style="color:var(--text-1);font-size:13px">Use server Whisper (phone falls back to Android STT on failure)</span>
+        </label>
+
+        <label class="field-label">Active model</label>
+        <select class="field-input" id="whisper-model" ${w.installedModels.length ? '' : 'disabled'}>
+          <option value="">— select —</option>
+          ${modelOptions}
+        </select>
+
+        <label class="field-label">Device</label>
+        <div>${deviceOptions}</div>
+
+        <div style="margin-top:14px;display:flex;gap:8px;align-items:center">
+          <button class="btn btn-primary btn-sm" id="whisper-save">Save &amp; apply</button>
+          ${running}
+        </div>
+        <p class="msg" id="whisper-msg"></p>
+
+        <h3 style="margin-top:18px;margin-bottom:8px;font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--text-2)">Installed models</h3>
+        ${installed}
+
+        <h3 style="margin-top:14px;margin-bottom:8px;font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--text-2)">Install a model</h3>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select class="field-input" id="whisper-install-model" style="flex:1" ${w.fasterWhisperInstalled ? '' : 'disabled'}>
+            ${missingModelsList.length
+              ? missingModelsList.map(m => `<option value="${m}">${m}</option>`).join('')
+              : '<option value="">all known models installed</option>'}
+          </select>
+          <button class="btn btn-primary btn-sm" id="whisper-install-btn" ${w.fasterWhisperInstalled && missingModelsList.length ? '' : 'disabled'}>Install</button>
+        </div>
+        <pre id="whisper-install-log" style="display:none;margin-top:8px;padding:8px;background:var(--bg-2);border-radius:6px;max-height:200px;overflow:auto;font-size:11px;color:var(--text-1);font-family:var(--font-mono)"></pre>
+      `;
+    }
+
+    function wireWhisperHandlers(w) {
+      const bootstrapBtn = document.getElementById('whisper-bootstrap-btn');
+      if (bootstrapBtn) {
+        bootstrapBtn.onclick = async () => {
+          bootstrapBtn.disabled = true;
+          const log = document.getElementById('whisper-bootstrap-log');
+          log.style.display = 'block';
+          log.textContent = 'Starting…\n';
+          startWhisperWsStream('whisper:bootstrap-progress', log, () => refreshWhisperPanel());
+          try {
+            await api('/admin/whisper/bootstrap', { method: 'POST' });
+          } catch (e) {
+            log.textContent += `ERROR: ${e.message}\n`;
+            bootstrapBtn.disabled = false;
+          }
+        };
+      }
+
+      const saveBtn = document.getElementById('whisper-save');
+      if (saveBtn) {
+        saveBtn.onclick = async () => {
+          const enabled = document.getElementById('whisper-enabled').checked;
+          const model = document.getElementById('whisper-model').value || null;
+          const device = document.querySelector('input[name="whisper-device"]:checked')?.value || 'auto';
+          const msg = document.getElementById('whisper-msg');
+          msg.textContent = 'Saving…';
+          msg.className = 'msg';
+          try {
+            const res = await api('/admin/whisper/config', { method: 'POST', body: JSON.stringify({ enabled, model, device }) });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || 'save failed');
+            msg.className = 'msg ok';
+            msg.textContent = data.running ? `Running: ${data.config?.model} on ${data.config?.device}` : 'Saved';
+            refreshWhisperPanel();
+          } catch (e) {
+            msg.className = 'msg err'; msg.textContent = e.message;
+          }
+        };
+      }
+
+      const installBtn = document.getElementById('whisper-install-btn');
+      if (installBtn) {
+        installBtn.onclick = async () => {
+          const model = document.getElementById('whisper-install-model').value;
+          if (!model) return;
+          installBtn.disabled = true;
+          const log = document.getElementById('whisper-install-log');
+          log.style.display = 'block';
+          log.textContent = `Downloading ${model}…\n`;
+          startWhisperWsStream('whisper:install-progress', log, () => refreshWhisperPanel());
+          try {
+            await api('/admin/whisper/install', { method: 'POST', body: JSON.stringify({ model }) });
+          } catch (e) {
+            log.textContent += `ERROR: ${e.message}\n`;
+            installBtn.disabled = false;
+          }
+        };
+      }
+
+      document.querySelectorAll('[data-delete-model]').forEach((btn) => {
+        btn.onclick = async () => {
+          const name = btn.getAttribute('data-delete-model');
+          if (!confirm(`Delete model "${name}"?`)) return;
+          try {
+            await api(`/admin/whisper/models/${encodeURIComponent(name)}`, { method: 'DELETE' });
+            refreshWhisperPanel();
+          } catch (e) { alert(e.message); }
+        };
+      });
+    }
+
+    // Subscribe to a WS channel for install/bootstrap progress until __DONE__ or __ERROR__.
+    function startWhisperWsStream(channel, logEl, onFinish) {
+      try {
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${proto}//${location.host}/?token=${encodeURIComponent(token)}`);
+        ws.onmessage = (ev) => {
+          let msg;
+          try { msg = JSON.parse(ev.data); } catch { return; }
+          if (msg.type !== channel) return;
+          logEl.textContent += msg.line + '\n';
+          logEl.scrollTop = logEl.scrollHeight;
+          if (msg.line === '__DONE__' || msg.line.startsWith('__ERROR__')) {
+            ws.close();
+            setTimeout(onFinish, 300);
+          }
+        };
+      } catch (e) {
+        logEl.textContent += `(WS stream unavailable: ${e.message})\n`;
+      }
+    }
+
+    function renderSessionRow(s) {
+      const hasResume = s.claudeSessionId ? 'Resume' : 'Open';
+      const title = s.claudeSessionId
+        ? `Resume claude session ${s.claudeSessionId.slice(0, 8)}...`
+        : 'Open directory in terminal with claude --resume';
+      return `
+        <div class="session-row">
+          <div class="session-info">
+            <div class="session-name">${s.name || 'Unnamed'}</div>
+            <div style="font-size:12px;color:var(--text-3);font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${s.cwd || ''}</div>
+          </div>
+          <div class="session-right">
+            <span class="session-status ${s.status || 'idle'}">${s.status || 'idle'}</span>
+            <button class="btn-open" data-session-id="${s.id}" title="${title}">${hasResume}</button>
+          </div>
+        </div>`;
+    }
+
+    function wireOpenButtons() {
+      document.querySelectorAll('.btn-open[data-session-id]').forEach(btn => {
+        btn.onclick = async (e) => {
+          e.stopPropagation();
+          const origText = btn.textContent;
+          btn.textContent = '...';
+          btn.disabled = true;
+          try {
+            const res = await api(`/sessions/${btn.dataset.sessionId}/open-terminal`, { method: 'POST' });
+            if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.error || 'Failed'); }
+            btn.textContent = 'Opened';
+            setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 2000);
+          } catch (err) {
+            btn.textContent = 'Error';
+            console.error(err);
+            setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 2000);
+          }
+        };
+      });
     }
 
     // ── Init ──

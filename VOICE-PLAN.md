@@ -1,227 +1,204 @@
-# Voice Mode — Implementation Plan
+# Voice Architecture
 
-100% hands-free voice interaction with Claude Code sessions. The user enters "voice mode" from any session — the keyboard collapses, a talk button appears, and TTS reads back Claude's responses. Claude Code still has full tool access (edit files, run commands, read code). The voice layer is purely an I/O adapter.
-
----
-
-## Design Principles
-
-- **Voice mode is a view toggle, not a new session.** Same terminal, same pty, same WebSocket. Just a different UI on top.
-- **Claude Code stays fully capable.** It still edits files, runs bash, reads code. Voice mode doesn't limit what it can do — it only changes how the user gives input and receives output.
-- **Input wrapping.** User speech is transcribed and wrapped with a short prefix that tells Claude to respond conversationally after completing its work. This doesn't restrict tool use — it just ensures Claude summarizes what it did in speakable prose. The prefix also asks Claude to wrap its spoken response in `~VOICE~` markers so the output parser can reliably extract it.
-- **Marker-based output extraction.** Instead of heuristically parsing terminal output (fragile), the input prefix asks Claude to put its voice-friendly response between `~VOICE~` markers. The parser just scans for content between markers — simple, reliable, survives Claude Code UI changes.
-- **No external dependencies.** Web Speech API for TTS. The phone's built-in keyboard STT is better than anything we'd build, but voice mode uses the SpeechRecognition API directly since the keyboard is hidden.
-- **Progressive.** Each layer is independently useful. Partially implemented voice mode is still better than no voice mode.
+How Claude Remote's voice mode actually works. The original implementation plan has been executed; this file describes the current system.
 
 ---
 
-## Future: Structured Mode (not yet viable)
+## Goal
 
-Claude Code offers a non-interactive mode (`claude -p --output-format stream-json`) that outputs clean JSON events instead of terminal output. Each text token, tool call, and tool result arrives as a separate JSON object. This would eliminate all output parsing — we'd get Claude's prose as `text_delta` events, tool use as structured `tool_use` blocks, and session management via `--resume $session_id`.
-
-**Why we can't use it yet:** `-p` mode requires an Anthropic API key and bills per-token. It doesn't work with Claude Max/Pro subscriptions, which only cover interactive (terminal) mode. If Anthropic adds subscription support for `-p` mode, or the user has an API key, this becomes the better architecture for everything — not just voice mode.
-
-**What it would change:** Sessions would no longer be ptys. The server would spawn `claude -p` subprocesses, parse JSON streams, and push structured events over WebSocket. The client would render text, tool status cards, and diffs from structured data instead of a raw terminal. Voice mode would get `text_delta` events directly — no markers needed.
-
-**For now:** We use pty sessions + `~VOICE~` markers for voice, and Claude Code hooks for notifications/status (see HOOKS-PLAN.md). Both work with interactive mode and Max subscriptions.
+100% hands-free voice interaction with Claude Code — walking, driving, or away from the computer. The user pushes one button, speaks, releases. Claude responds, and the response is spoken back through native Android TTS. Slash commands are invokable by voice for server-ops use cases (restart Apache, flush cache, etc.).
 
 ---
 
-## Layer 0 — Clean Slate
+## Architecture at a glance
 
-Remove all existing voice code. It was a rough first pass that doesn't fit the new design.
-
-**Remove from app.js:**
-- `accumulateForTTS()` function and its call in `handleWSMessage`
-- `speak()` function
-- `initSTT()` function and its call in `initSessionView`
-- `toggleRecording()` function
-- Mic button event listener
-- Voice toggle button (`#btn-voice`) event listener
-- All related state: `ttsEnabled`, `smartTts`, `speechRate`, `selectedVoiceURI`, `sttLang`, `recognition`, `recording`, `ttsAccum`, `ttsTimer`
-- Settings UI for all of the above (TTS/STT toggles, voice selection, speech rate, language)
-
-**Remove from index.html:**
-- Mic button element
-- Voice toggle button element
-- Settings template rows for TTS, STT, voice, speech rate, language
-
-**Remove from style.css:**
-- Mic button styles, recording indicator styles, voice-related CSS
-
-**Keep:**
-- Attention system (vibration, push notifications, chime) — that's separate from voice mode
-- Quick action buttons (Yes/No/Enter/Ctrl-C) — still useful in normal mode
-
-**Test:** Everything works exactly as before minus mic and TTS. No regressions.
-
----
-
-## Layer 1 — Voice Mode UI Shell
-
-The visual container. No actual voice functionality yet — just the mode toggle and layout.
-
-**Changes:**
-
-Add a "voice mode" toggle button in the session view top bar (next to raw/clean toggle). When activated:
-- Keyboard and command input area collapse (hidden)
-- Quick action buttons collapse (hidden)
-- A voice mode overlay appears over the bottom portion of the screen:
-  - Central **talk button** (large, round, prominent)
-  - Animated indicator showing voice mode is active (pulsing ring, waveform gif, or CSS animation — something that makes it obvious the mode is on)
-  - A small text area showing the last transcript (what the user said) and last response (what Claude said) — useful for glancing at while walking
-  - An exit button to return to normal mode
-- Terminal view stays visible above the overlay (scrolled to bottom, still live-updating)
-- Raw/clean toggle still works in voice mode
-
-**State:**
-- `voiceMode: false` — added to app state
-- Persisted to localStorage so it remembers across navigations
-
-**Test:** Toggle voice mode on and off. Terminal stays visible. Keyboard appears/disappears. The overlay renders. Nothing breaks in normal mode. Switching sessions while in voice mode keeps the mode active.
+```
+┌───────────────────────────────┐
+│  Phone (Capacitor WebView)    │
+│                               │
+│  • Push-to-talk → STT         │
+│  • Voice-mode overlay         │
+│  • Native Android TTS bridge  │
+└──────────────┬────────────────┘
+               │  WebSocket (input/output/speak)
+               ▼
+┌───────────────────────────────┐
+│  Node.js server               │
+│                               │
+│  • /api/voice/speak  (TTS)    │
+│  • /api/cmd/queue    (slash)  │
+│  • WS broadcasts `speak`      │
+└──────────────┬────────────────┘
+               │  pty I/O + env vars
+               ▼
+┌───────────────────────────────┐
+│  Claude Code (in pty)         │
+│                               │
+│  • runs `speak "..."` scripts │
+│  • runs `cmd clear` scripts   │
+│  • PATH has scripts/ dir      │
+└───────────────────────────────┘
+```
 
 ---
 
-## Layer 2 — Talk Button + STT
+## Input: push-to-talk → STT
 
-Wire up the talk button to SpeechRecognition.
+Client-side (`client/www/js/app.js`):
+- Press and hold the talk button in the voice overlay → `startVoiceRecording()` starts Web Speech API STT (Android SpeechRecognition under the hood).
+- When server-side Whisper is enabled (`refreshWhisperStatus()` returned `whisperEnabled: true`), `startVoiceRecording` also opens a `MediaRecorder` on the same mic stream to capture raw audio in parallel.
+- Release → `stopVoiceRecording()` finalizes the Android transcript. If a Whisper audio blob was captured, it's POSTed to `/api/voice/transcribe` (timeout 2500 ms). If Whisper returns non-empty text in time, that text replaces the Android transcript; otherwise the Android transcript is used.
+- Final transcript is sent to the pty over WebSocket, optionally wrapped with a voice-mode instruction prefix (see below).
 
-**Changes:**
+Why both paths: Android SpeechRecognition is fast and free but sometimes mangles technical jargon (flag names, CLI tools, command options). Whisper is more accurate but adds latency and requires host compute. The parallel capture + "prefer Whisper if it's ready in time" pattern gives the accuracy win when the host keeps up and falls back gracefully when it doesn't.
 
-- Press and hold the talk button → start recording (SpeechRecognition)
-- Release → stop recording, finalize transcript
-- Transcript appears in the voice mode text area
-- Transcript is sent to the terminal as input (raw, no wrapping yet — that's Layer 3)
-- Visual feedback:
-  - While recording: talk button changes color/animation, maybe a pulse or glow
-  - While processing: brief spinner or "..." indicator
-  - On send: transcript text flashes or fades to confirm it was sent
-- Also support **tap to start, tap to stop** (alternative to press-and-hold, useful for longer speech)
-- Silence detection: if the user pauses for 3+ seconds, auto-stop and send (configurable later)
-- Handle errors gracefully: `no-speech` → reset silently, network error → show toast
+### Server-side Whisper (optional)
 
-**No TTS yet** — just getting input working first.
+The server-side STT stack is **off by default** and managed from the admin panel (`Whisper (Server STT)` card):
 
-**Test:** Enter voice mode. Hold talk button, speak a command to Claude, release. Does the transcript appear? Is it sent to the terminal? Does Claude receive it and respond (visible in the terminal above)?
+1. **Bootstrap** — `POST /api/admin/whisper/bootstrap` creates a venv at `{data-dir}/whisper-venv/` and installs `faster-whisper`. Progress streams over WS as `whisper:bootstrap-progress` lines.
+2. **Install a model** — `POST /api/admin/whisper/install` downloads a model (tiny.en, base.en, small.en, medium.en, large-v3, large-v3-turbo) into `{data-dir}/whisper-models/`. Progress streams as `whisper:install-progress`.
+3. **Configure + enable** — `POST /api/admin/whisper/config` with `{enabled, model, device}` persists to `server-settings.json` and boots a long-lived helper subprocess (`server/whisper/transcribe.py`) via `WhisperHelper.start()`. Device options: `auto` (cuda if `nvidia-smi` works, else cpu), `cpu`, `cuda`.
+4. **Transcribe** — `POST /api/voice/transcribe` accepts the audio blob, routes it to the helper over stdin/stdout JSON, returns `{text}`.
 
----
+The helper process lives for the life of the server — the model is loaded once and held in memory, so per-request latency is just the actual inference cost.
 
-## Layer 3 — Input Wrapping
+### Voice-mode wrapping
 
-When voice mode is active, wrap the user's transcript before sending it to the terminal so Claude responds in voice-friendly prose.
+When `voiceMode` is on and the session is not answering a prompt, the transcript is prefixed with:
 
-**Changes:**
+```
+[Voice mode. Do your work normally — edit files, run commands, etc. After
+completing your work, run the shell command: speak "your concise spoken
+summary here". That text will be read aloud via TTS on the phone. Do not
+duplicate the summary in your text output.]
 
-- When voice mode is on, instead of sending raw transcript, prepend a brief instruction:
-  ```
-  [Voice mode. Do your work normally — edit files, run commands, read code, whatever is needed.
-  When you're done, wrap your spoken response in ~VOICE~ markers like this:
-  ~VOICE~
-  Your conversational summary here. Keep it concise — this will be read aloud.
-  ~VOICE~
-  The markers MUST appear on their own lines. Everything between them is sent to text-to-speech.
-  Everything outside them (tool output, diffs, etc) is shown in the terminal but not spoken.]
-  
-  {user's transcript}
-  ```
-- The prefix is only prepended on the **first message** after entering voice mode, or after Claude returns to idle. Don't repeat it every message — Claude Code maintains context within a conversation.
-- Actually: test both approaches (every message vs first-only). Claude Code conversations can be long, and context may drift. Start with every message since it's simpler.
-- The prefix should NOT appear in subsequent voice messages if Claude is in a follow-up exchange (e.g., Claude asks "which file?" and the user responds "the main one"). Detect this by checking if the session is in `waiting` status — if so, send raw transcript without prefix.
-- **Fallback**: If Claude forgets the markers (it will sometimes), fall back to heuristic parsing of the last output chunk. But the markers should work 90%+ of the time since Claude is good at following formatting instructions.
+{transcript}
+```
 
-**Test:** Enter voice mode. Ask Claude to "read the README and tell me what the project does." Does Claude read the file (tool use visible in terminal) and respond with a conversational summary? Ask it to "add a comment to the top of app.js explaining what it does." Does it edit the file AND explain what it did in prose?
+This tells Claude to run the `speak` shell script at end of turn. That's the mechanism that produces TTS output (see below).
 
 ---
 
-## Layer 4 — Output Parsing + TTS
+## Output: `speak` shell script → WS → native TTS
 
-The big one. Parse Claude Code's terminal output to extract speakable content, then read it aloud.
+Instead of parsing Claude's terminal output for speech content (which was fragile — ANSI cleanup, markers, streaming races), we use a **side channel**:
 
-**Changes:**
+1. Claude runs `speak "summary text"` at end of turn.
+2. `scripts/speak` (on pty PATH via `sessions.js:_makePtyEnv`) POSTs to `POST /api/voice/speak` on localhost with `{sessionId, text}`.
+3. The server emits `session:speak` and broadcasts a dedicated WS message: `{type: "speak", sessionId, text}`.
+4. Client's `handleWSMessage` receives `speak`, calls `speakVoice(text)`.
+5. `speakVoice` sends the text to the bootstrap/Android bridge via `postMessage({type: "speak", text})`. Native Android TTS plays it through the media audio stream (follows headphones / car Bluetooth).
 
-**Output parser** — scan terminal output for `~VOICE~` markers:
-
-The input prefix (Layer 3) asks Claude to wrap its spoken response in `~VOICE~` markers. The parser:
-- Strips ANSI codes from incoming terminal chunks
-- Buffers text, looking for `~VOICE~` start marker
-- Captures everything between `~VOICE~` and the closing `~VOICE~`
-- Sends captured text to TTS
-- Ignores everything outside the markers (tool output, diffs, prompts)
-
-This is far more reliable than heuristic line-by-line filtering. Claude is asked to produce the markers, and we just extract them. If Claude Code's UI framing changes, the markers still work because they're in Claude's response text, not the UI chrome.
-
-**Fallback** (when markers are missing): If no `~VOICE~` markers appear after Claude returns to idle, fall back to basic heuristic — take the last block of non-code, non-tool text and speak it. This covers cases where Claude forgets the markers or the user is in a quick Y/N exchange.
-
-**TTS:**
-- Use `speechSynthesis.speak()` with the parsed prose
-- Break long text into sentence-sized utterances (split on `.`, `!`, `?`) for natural pacing
-- Queue utterances rather than canceling — Claude might produce multiple paragraphs
-- While TTS is speaking, show the text in the voice mode overlay (so user can read along)
-- When TTS finishes all queued utterances, play a subtle tone indicating it's the user's turn
-- If user presses talk button while TTS is speaking, cancel TTS immediately (interrupt-to-speak)
-
-**Voice settings** (in the voice mode overlay, not main settings):
-- Voice selection (dropdown of available voices)
-- Speech rate slider
-- These persist to localStorage
-
-**Test:** Enter voice mode. Ask Claude to edit a file. Watch the terminal — you should see normal Claude Code output. Listen — you should hear only the summary/explanation, not the diff or file contents. Ask Claude "what does the main function in server.js do?" — it should read the file and explain it aloud.
+Benefits vs. the old marker-based parser:
+- Text never touches the terminal stream — nothing to parse, no false positives.
+- Works reliably regardless of Claude Code UI framing changes.
+- Shell-quoted strings in `speak "..."` survive exactly as intended.
+- Localhost-only endpoint + env-var-based auth (`CLAUDE_REMOTE_SESSION_ID` must be set) means only code running inside a Claude Remote pty can trigger TTS.
 
 ---
 
-## Layer 5 — Physical Button Mapping
+## Hands-free slash commands: "system command X"
 
-Map a hardware button to the talk function so the user doesn't need to look at the screen.
+For server-ops use cases (emergency maintenance, cache flushes, service restarts), the user needs to fire slash commands without looking at the phone.
 
-**Changes:**
+`tryParseVoiceCommand` in app.js detects the prefix **"system command"** at the start of a transcript and rewrites:
 
-- **Volume button**: Capture volume-down key event in voice mode → trigger talk button. Requires Capacitor plugin or Android-level event handling. Volume-up could cancel/stop.
-- **Headphone button**: Media button events via `navigator.mediaSession` or Capacitor plugin. Single press = toggle recording.
-- **Bluetooth headset**: Same media button API. Test with common Bluetooth earbuds.
-- Add a setting to choose which button maps to talk (or disable hardware mapping).
-- When using hardware button, provide haptic feedback (vibration) on press/release so the user knows it registered.
+| Utterance | Behavior |
+|---|---|
+| "system command clear" | sends `/clear` raw to pty (no wrapper) |
+| "system command compact" | sends `/compact` raw |
+| "system command cost" | sends `/cost`, then auto-fires a follow-up voice prompt so Claude summarizes the output via `speak` |
+| "system command status" | same pattern — fires `/status`, Claude summarizes aloud |
+| "system command model opus" | sends `/model opus` raw |
+| "system command stop" | sends `\x03` (Ctrl+C) to cancel generation — not a slash command |
+| "system command restart-apache" | sends `/restart-apache` raw — works for any custom skill |
 
-**Test:** Plug in wired headphones. Press the inline button — does recording start? Press again — does it stop and send? Try with Bluetooth earbuds. Try with volume button while phone is in pocket.
+The mapping is **dynamic** — whatever follows "system command" becomes `/<rest>`. Exceptions:
 
----
+- **Ctrl+C aliases** (`stop`, `cancel`, `abort`, `escape`): send the raw byte instead.
+- **Known interactive commands** (`help`, `agents`, `config`, `resume`, `permissions`, `mcp`, `hooks`, `output-style`, `ide`, `vim`, `login`, `logout`, and `model` with no args): intercepted. Instead of firing the command and getting stuck in a modal, the client speaks guidance (e.g., "Specify the model: system command model opus, sonnet, or haiku").
+- **Context-wiping commands** (`clear`, `compact`, `exit`, `quit`, `init`): skip the follow-up summary prompt to avoid wasting a turn on confirmation.
 
-## Layer 6 — Hands-Free (No Button)
+### Output interpretation
 
-Experimental: fully buttonless voice mode using silence detection and wake-word-like behavior.
+When a slash command prints informational output (`/cost`, `/status`, etc.), the client automatically fires a follow-up voice-mode prompt after 700ms:
 
-**Changes:**
+> `[Voice mode. The slash command output is visible above in this turn as local-command-stdout. Summarize the result in one short natural sentence and call the shell command: speak "your one-sentence summary". Do not print any other text or duplicate the summary.]`
 
-- **Continuous listening mode** toggle within voice mode
-- Mic stays active, STT runs continuously
-- When user speaks → buffer transcript
-- When silence detected (2-3 seconds) → send transcript
-- When TTS is speaking → pause STT (so it doesn't hear itself), resume after
-- Post-TTS beep/tone → "your turn to speak"
-- Challenge: ambient noise, false triggers. May need a confidence threshold.
-- Challenge: distinguishing "user is talking to Claude" from "user is talking to someone else." Could use a trigger phrase ("hey Claude") but that adds friction. Start without one, see how it goes.
-
-**Test:** Turn on continuous listening. Set phone on desk. Have a 5-minute design conversation with Claude. Can you go back and forth without touching the phone at all?
+This triggers a Claude turn. Claude Code bundles the slash command's stdout into that turn automatically, so Claude sees the output and summarizes it via `speak`. The user hears a natural-language summary instead of having to read.
 
 ---
 
-## Open Questions
+## Claude firing slash commands (`cmd` script)
 
-1. **Marker reliability.** How often will Claude forget or malform the `~VOICE~` markers? Needs real-world testing. If it's unreliable, we may need to reinforce the instruction or try a different marker format.
+For end-of-turn cleanup (e.g., `/compact` after a long conversation), Claude needs to trigger slash commands itself. But slash commands only execute when the TUI prompt is active — during Claude's response, stdin is being consumed.
 
-2. **Long operations.** If Claude is editing 10 files, the user hears nothing for 30+ seconds. Should we provide interim status? ("Still working... edited 3 files so far.") Claude Code hooks (see HOOKS-PLAN.md) could push `PostToolUse` events to the client, which voice mode could speak as brief status updates.
+Solution: `scripts/cmd` + a server-side queue + the Stop hook.
 
-3. **Error handling.** If Claude hits an error, will it put the error message inside `~VOICE~` markers? The prefix should instruct it to do so. Test with permission denials, file-not-found, etc.
-
-4. **Session switching.** Voice commands for "switch to [session name]" and "list sessions" would be natural but that's navigation logic on top of the voice I/O layer. Defer to after the core works.
-
-5. **Prompt prefix tuning.** The voice mode prefix in Layer 3 will need iteration. Too long and it wastes context. Too short and Claude forgets to summarize or omits markers. Test and adjust.
-
-6. **Hooks integration.** Once HOOKS-PLAN.md is implemented, voice mode can use hook-driven events (tool use, idle, waiting) instead of terminal parsing for status awareness. This makes voice mode more resilient to Claude Code updates.
+1. Claude runs `cmd clear` (or `cmd model opus`, `cmd compact`, etc.) at end of turn.
+2. `scripts/cmd` POSTs to `POST /api/cmd/queue` → server stores in `session._queuedCommands`.
+3. When the Stop hook fires (i.e., Claude's turn just ended, prompt is ready), `sessions.handleHookEvent('stop')` calls `_flushQueuedCommands`.
+4. After a 300ms delay (so the TUI fully redraws the prompt), the queued `/command\r` bytes are written to the main tab's pty.
+5. Claude Code's TUI sees real user input at the prompt → the slash command executes.
 
 ---
 
-## Implementation Order
+## Auto-accept (fast path via PreToolUse)
 
-Start with Layer 0 (rip out old code) → Layer 1 (UI shell) → Layer 2 (talk button) → test heavily → Layer 3 (input wrapping) → Layer 4 (output parsing + TTS) → test heavily → then Layers 5-6 based on how it feels.
+Related voice-enabling feature: the phone has an auto-accept toggle per session. When enabled, Claude never blocks on permission prompts.
 
-Each layer gets committed, pushed, and tested on the phone before moving to the next.
+Two layers:
+
+1. **PreToolUse hook** (`scripts/claude-preauth-hook.sh`, wired in `~/.claude/settings.json`): fires *before* Claude Code draws a permission prompt. The hook consults `POST /api/hooks/preauth` which returns `{permissionDecision: "allow"}` when the session's `autoAccept` is on. No prompt is ever drawn — instant.
+2. **Notification hook fallback** (`scripts/claude-hook-relay.sh`): if a prompt does appear (e.g., older Claude Code versions), the server writes `\r` to the pty to dismiss it. Slower but still functional.
+
+This matters for voice because draw/dismiss round-trips were noticeable on mobile.
+
+---
+
+## Piece-by-piece file map
+
+| Concern | File |
+|---|---|
+| Voice overlay UI, push-to-talk, STT | `client/www/js/app.js` (search "voice") |
+| "system command" prefix detection | `client/www/js/app.js` — `tryParseVoiceCommand` |
+| Auto follow-up summarization prompt | `client/www/js/app.js` — inside `stopVoiceRecording` |
+| Native TTS bridge | `client/www/js/app.js` — `speakVoice` → `window.parent.postMessage` |
+| Bootstrap / Android native bridge | `client/bootstrap/index.html` (NativeBridge) |
+| `speak` endpoint | `server/server.js` — `/api/voice/speak` |
+| `cmd` queue endpoint | `server/server.js` — `/api/cmd/queue` |
+| Queue + flush logic | `server/sessions.js` — `queueCommand`, `_flushQueuedCommands`, Stop hook |
+| PreToolUse endpoint | `server/server.js` — `/api/hooks/preauth` |
+| Pty env + PATH injection | `server/sessions.js` — `_makePtyEnv` |
+| `speak` shell script | `scripts/speak` |
+| `cmd` shell script | `scripts/cmd` |
+| PreToolUse hook | `scripts/claude-preauth-hook.sh` |
+| Legacy Notification hook relay | `scripts/claude-hook-relay.sh` |
+| Server-side Whisper lifecycle | `server/whisper-manager.js` |
+| Whisper helper subprocess | `server/whisper/transcribe.py` |
+| Whisper admin endpoints | `server/server.js` — `/api/admin/whisper/*` |
+| Whisper transcribe endpoint | `server/server.js` — `/api/voice/transcribe` |
+| Parallel mic capture on phone | `client/www/js/app.js` — `_voiceMediaRecorder`, `transcribeWithWhisper` |
+| Whisper admin UI | `client/www/admin.html` — `#whisper-card` |
+
+---
+
+## Known gaps
+
+- **Permission prompts with auto-accept off**: no hands-free path to approve a single prompt. You'd need to tap the approve button or turn on auto-accept globally.
+- **Waveform visualization**: uses SpeechRecognition events (`onspeechstart`), ~200ms latency. Real audio-reactive waveform requires `getUserMedia` which needs HTTPS. Low priority — cosmetic.
+- **Continuous / wake-word listening**: not implemented. Push-to-talk remains the only activation. Works fine on Bluetooth and wired headsets via the phone's physical button.
+- **Structured output mode**: Claude Code's `-p --output-format stream-json` would eliminate terminal-stream complexity entirely, but still requires an API key (no subscription support as of writing). Not blocking anything today.
+
+---
+
+## Adding a new voice command
+
+You almost never need to. The dynamic passthrough handles new Claude Code slash commands automatically (`"system command X"` → `/X`). But if you want to intercept or remap one:
+
+1. Edit `tryParseVoiceCommand` in `client/www/js/app.js`.
+2. Add the command name to `interactiveGuides` (intercept with spoken guidance), or to `skipInterpret` (fire but skip summarization), or add a regex pattern above the dynamic fallthrough.
+3. Reload the app (no server restart needed — client JS only).
+
+Custom Claude Code skills are the recommended extension pattern for domain operations (`/restart-apache`, `/flush-cache`, etc.). Define them in `~/.claude/skills/` — they're automatically voice-invokable via "system command \<skill-name\>" with no app changes.

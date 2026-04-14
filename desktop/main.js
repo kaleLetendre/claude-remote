@@ -117,6 +117,30 @@ function updateTrayMenu() {
         }
       },
     },
+    { type: 'separator' },
+    {
+      label: 'Reload Admin',
+      // Force a fresh load of the admin window, clearing its cache. Useful after
+      // server-side client/www/ changes since Electron's WebView can cache aggressively.
+      click: async () => {
+        if (adminWindow) {
+          try { await adminWindow.webContents.session.clearCache(); } catch {}
+          adminWindow.loadURL(`http://localhost:${serverPort}/admin?token=${serverToken}&t=${Date.now()}`);
+          adminWindow.show();
+          adminWindow.focus();
+        } else {
+          openAdmin();
+        }
+      },
+    },
+    { type: 'separator' },
+    {
+      label: 'Quit',
+      click: () => {
+        app.isQuitting = true;
+        app.quit();
+      },
+    },
   ];
   const menu = Menu.buildFromTemplate(template);
   tray.setContextMenu(menu);
@@ -124,14 +148,19 @@ function updateTrayMenu() {
 
 // ── Admin window ────────────────────────────────────────────
 
-function openAdmin() {
+async function openAdmin() {
+  readSettings();
+  const url = `http://localhost:${serverPort}/admin?token=${serverToken}&t=${Date.now()}`;
+
   if (adminWindow) {
+    // Reuse the window but force a fresh load — clear cache so updated HTML/JS is fetched.
+    try { await adminWindow.webContents.session.clearCache(); } catch {}
+    adminWindow.loadURL(url);
     adminWindow.show();
     adminWindow.focus();
     return;
   }
 
-  readSettings();
   adminWindow = new BrowserWindow({
     width: 800,
     height: 700,
@@ -144,7 +173,8 @@ function openAdmin() {
     },
   });
 
-  adminWindow.loadURL(`http://localhost:${serverPort}/admin?token=${serverToken}`);
+  try { await adminWindow.webContents.session.clearCache(); } catch {}
+  adminWindow.loadURL(url);
 
   adminWindow.on('close', (e) => {
     if (!app.isQuitting) {

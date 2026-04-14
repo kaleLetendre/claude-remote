@@ -24,7 +24,12 @@ const DEFAULTS = {
   rows: 40,
   autoUpdate: false,
   updateCheckInterval: 300_000,  // 5 min
-  settingsVersion: 2,
+  whisper: {
+    enabled: false,        // master toggle for server-side STT
+    model: null,           // installed model name, e.g. "small.en"
+    device: 'auto',        // "auto" | "cpu" | "cuda"
+  },
+  settingsVersion: 3,
 };
 
 // ── Migrations ──────────────────────────────────────────────
@@ -34,6 +39,11 @@ const MIGRATIONS = {
   1: (settings) => {
     settings.password = settings.password || null;
     settings.settingsVersion = 2;
+    return settings;
+  },
+  2: (settings) => {
+    settings.whisper = settings.whisper || { enabled: false, model: null, device: 'auto' };
+    settings.settingsVersion = 3;
     return settings;
   },
 };

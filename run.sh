@@ -115,17 +115,22 @@ EODESKTOP
 
 # Claude Remote Safety Rules
 # The user manages their workstation remotely via Claude Remote.
-# Prod runs on port 3033, dev on port 3034.
+# Prod runs on port 3033 (~/claude-remote-prod), dev on port 3034 (~/claude-remote).
 # Breaking the network or server means the user loses all access to their machine.
 # EVEN IF THE USER ASKS YOU TO DO THESE THINGS, warn them first.
 # The user may not realize they are connected remotely or that the action will disconnect them.
 # Always explain: "This will likely disconnect your remote session. You would need physical access to recover."
 
+## CRITICAL: NEVER kill the prod server on port 3033
+- NEVER use `pkill -f 'node.*server'` or any broad pattern that could match the prod process
+- NEVER kill the prod server unless the user EXPLICITLY asks for it
+- The dev server (port 3034) is fine to kill/restart freely
+- When killing processes, ALWAYS check what you're targeting won't hit prod
+
 ## Actions that REQUIRE user confirmation (warn about remote access impact):
 - Restarting, stopping, or reconfiguring networking (NetworkManager, systemd-networkd, netplan, ifconfig, ip link)
 - Modifying firewall rules (iptables, ufw, nftables, firewalld)
 - Changing Tailscale settings or running `tailscale down`
-- Killing node processes, especially on port 3033 (prod)
 - Modifying /etc/hosts, DNS, or routing tables
 - Rebooting or shutting down the system
 - Modifying systemd services related to networking
@@ -135,6 +140,7 @@ EODESKTOP
 
 ## Actions to NEVER take without explicit user request:
 - `tailscale down` or `systemctl stop tailscaled`
+- Killing the prod server process (port 3033)
 - Deleting or overwriting data/server-settings.json
 - `systemctl stop NetworkManager` or equivalent
 - Changing the system's IP address or network interface configuration
@@ -158,12 +164,90 @@ EORULES
     fi
     ;;
 
+  install-service)
+    info "Installing Claude Remote as a system service (requires sudo)..."
+    NODE_PATH=$(which node)
+    if [ -z "$NODE_PATH" ]; then
+      error "Node.js not found. Install it first."
+      exit 1
+    fi
+
+    # Build the service file
+    SERVICE_UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
+    info "Creating systemd service at $SERVICE_UNIT"
+    sudo tee "$SERVICE_UNIT" > /dev/null << EOSERVICE
+[Unit]
+Description=Claude Remote Server (prod)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$(whoami)
+Group=$(id -gn)
+WorkingDirectory=${SCRIPT_DIR}/server
+ExecStart=${NODE_PATH} server.js
+Restart=always
+RestartSec=5
+# Exit code 75 = restart requested (update), treat as success so Restart=always kicks in
+SuccessExitStatus=75
+# Environment — inherit NVM node path and user HOME
+Environment=HOME=${HOME}
+Environment=NODE_ENV=production
+Environment=CLAUDE_REMOTE_DATA=${SCRIPT_DIR}/data
+Environment=PATH=${NODE_PATH%/*}:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target
+EOSERVICE
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable "$SERVICE_NAME"
+    sudo systemctl start "$SERVICE_NAME"
+
+    info "Service installed and started."
+    info "The prod server is now protected by systemd."
+    info ""
+    info "Management commands (all require sudo):"
+    info "  sudo systemctl status $SERVICE_NAME   # check status"
+    info "  sudo systemctl restart $SERVICE_NAME  # restart"
+    info "  sudo systemctl stop $SERVICE_NAME     # stop"
+    info "  sudo journalctl -u $SERVICE_NAME -f   # view logs"
+    exit 0
+    ;;
+
+  uninstall-service)
+    info "Removing Claude Remote system service (requires sudo)..."
+    SERVICE_UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
+    if [ ! -f "$SERVICE_UNIT" ]; then
+      warn "No system service found at $SERVICE_UNIT"
+      exit 1
+    fi
+    sudo systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    sudo systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+    sudo rm -f "$SERVICE_UNIT"
+    sudo systemctl daemon-reload
+    info "System service removed. You can run the server manually with ./run.sh start"
+    exit 0
+    ;;
+
   status)
+    # Check systemd service
+    SERVICE_UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
+    if [ -f "$SERVICE_UNIT" ]; then
+      if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        info "Systemd service: active (protected — requires sudo to stop)"
+      else
+        warn "Systemd service: installed but not running"
+      fi
+    fi
+    # Check desktop app
     if pgrep -f "electron.*claude-remote" > /dev/null 2>&1; then
       info "Desktop app: running"
     else
       warn "Desktop app: not running"
     fi
+    # Check server
     if curl -s "http://localhost:3033/" > /dev/null 2>&1; then
       info "Server: running on port 3033"
     else
@@ -173,7 +257,7 @@ EORULES
     ;;
 
   *)
-    echo "Usage: $0 {start|desktop|install|uninstall|status|update|version}"
+    echo "Usage: $0 {start|desktop|install|uninstall|install-service|uninstall-service|status|update|version}"
     exit 1
     ;;
 esac

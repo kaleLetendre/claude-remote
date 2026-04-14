@@ -12,6 +12,16 @@ The user wants to go for a walk while Claude Code works on their computer. They 
 3. Notifications/alerts when Claude needs attention
 4. Voice-first hands-free interaction (nice to have)
 
+### Target use case: hands-free server ops
+
+Beyond casual walking-and-coding, Claude Remote is aimed at **remote/emergency server maintenance by IT professionals** — restarting Apache, flushing a cache, tailing logs, rolling back a deploy — from a phone, via voice, without needing to be at a computer or SSH'd in. The combination of Claude Code's skills system (custom slash commands) and voice mode's `"system command X"` prefix makes this viable: an operator can define skills like `/restart-apache`, `/flush-cache`, `/rollback-last-deploy`, then invoke them hands-free while driving or away from their desk. The skills themselves contain the actual commands and safety checks; the operator just says the name. This is the key reason voice mode, the `speak` / `cmd` side-channel scripts, and the dynamic `system command` prefix all matter — they're the interface for emergency ops.
+
+Practical pattern:
+- Operator writes a Claude Code skill (markdown file) per common op.
+- Skill encodes the correct shell commands, safety prompts, and output summarization.
+- Operator invokes hands-free: *"system command restart-apache"* → `/restart-apache` fires → Claude runs the skill → spoken confirmation via `speak`.
+- `system command help` or asking Claude directly lists available ops.
+
 ---
 
 ## Architecture Overview
@@ -66,12 +76,12 @@ The user wants to go for a walk while Claude Code works on their computer. They 
 **CLI** (`cli.js` in project root):
 - Headless management tool — everything the admin panel can do
 - Commands: `setup`, `start`, `status`, `token`, `url`, `clients`, `sessions`, `set-password`, `remove-password`, `restart`, `check-update`, `apply-update`, `build-apk`, `setup-hooks`
-- Reads auth token directly from `data/server-settings.json`
+- Reads auth token directly from the data-dir's `server-settings.json` (default `~/.claude-remote/`, overridable via `CLAUDE_REMOTE_DATA`)
 
 **Networking**:
 - Designed for Tailscale (mesh VPN). Server auto-detects Tailscale IP (`100.x.x.x`) on startup.
 - Also works on LAN. WAN requires a tunnel (Tailscale, Cloudflare, SSH).
-- Auth: persistent token stored in `data/server-settings.json`, generated on first run.
+- Auth: persistent token stored in `{data-dir}/server-settings.json`, generated on first run. Data dir defaults to `~/.claude-remote/` and is overridable via the `CLAUDE_REMOTE_DATA` env var (used to separate prod and dev data).
 - Password auth: optional, set via admin panel or CLI. Password exchanged for token via `POST /api/auth/login`.
 - CORS enabled for Capacitor WebView (`capacitor://localhost`) and all origins.
 
@@ -87,7 +97,7 @@ Single source of truth for versioning. Contains:
 - `changelog`: array of version entries shown in update banners
 
 ### `cli.js` (project root)
-CLI tool for headless server management. Uses the same REST API as the admin panel. Reads token from `data/server-settings.json`. Commands: setup, start, status, token, url, clients, sessions, set-password, remove-password, restart, check-update, apply-update, build-apk, setup-hooks.
+CLI tool for headless server management. Uses the same REST API as the admin panel. Reads token from the data-dir's `server-settings.json` (see `lib/paths.js`). Commands: setup, start, status, token, url, clients, sessions, set-password, remove-password, restart, check-update, apply-update, build-apk, setup-hooks.
 
 ### `run.sh` (project root)
 Process wrapper script. Modes:
@@ -107,21 +117,36 @@ Main entry point. Sets up Express, WebSocket, routes. Key sections:
 - `POST /api/auth/login` — exchanges password for token (unauthenticated endpoint)
 - REST routes: `/api/sessions`, `/api/files`, `/api/info`, `/api/version`, `/api/update/*`, `/api/restart`
 - Admin routes: `/api/admin/status`, `/api/admin/password`, `/api/admin/token`
+- Whisper admin routes: `/api/admin/whisper/status`, `/api/admin/whisper/bootstrap`, `/api/admin/whisper/install`, `/api/admin/whisper/models/:name` (DELETE), `/api/admin/whisper/config`
+- Voice routes: `/api/voice/speak`, `/api/cmd/queue`, `/api/voice/status`, `/api/voice/transcribe` (server-side Whisper STT)
 - APK distribution: `/api/app/version` (unauthenticated), `/api/app/download`
 - WebSocket message types: `subscribe`, `unsubscribe`, `input`, `resize`, `list`, `ping`
 - Tracks connected WS clients in `connectedClients` Map (IP, connect time, subscribed session)
 - Broadcasts `sessions` list to all clients every 3 seconds
 - `detectIPs()` finds LAN and Tailscale interfaces
 
+### `lib/paths.js`
+Canonical path resolution. `getDataDir()` returns `CLAUDE_REMOTE_DATA` if set, else `~/.claude-remote/`. `PACKAGE_ROOT` points to the repo root. Exposes `getSettingsPath()`, `getSessionsPath()`, `getConnectionInfoPath()`, `getVersionPath()`, `ensureDataDir()`. `migrateDataDir()` runs once at startup and copies legacy `./data/server-settings.json` + `sessions.json` into the data dir for existing users.
+
 ### `server/settings.js`
 Versioned settings with migration support and password hashing.
-- `PATHS` — canonical file locations (all in `data/` which is git-ignored)
-- `DEFAULTS` — default server settings including `authToken: null`, `password: null`
-- `MIGRATIONS` — currently has v1→v2 migration (adds password field)
+- `PATHS` — canonical file locations (delegated to `lib/paths.js`, data is git-ignored and stored outside the repo by default)
+- `DEFAULTS` — default server settings including `authToken: null`, `password: null`, `whisper: { enabled, model, device }`
+- `MIGRATIONS` — v1→v2 (adds password), v2→v3 (adds `whisper` block). Current `settingsVersion` is **3**.
 - `loadServerSettings()` — loads from file, applies env var overrides, runs migrations
-- `saveServerSettings()` — writes to `data/server-settings.json`
+- `saveServerSettings()` — writes to `{data-dir}/server-settings.json`
 - `hashPassword(password)` — returns `{ hash, salt }` using `crypto.scryptSync`
 - `verifyPassword(password, stored)` — constant-time comparison with `timingSafeEqual`
+
+### `server/whisper-manager.js`
+Server-side Whisper STT stack (optional; defaults off). Lets operators run `faster-whisper` on the host for higher accuracy than Android SpeechRecognition.
+- Host capability detection: `findPython3()`, `isCudaAvailable()`, `isFfmpegAvailable()`, `isVenvReady()`, `isFasterWhisperInstalled()`
+- `bootstrap(onLog)` — creates a managed venv at `{data-dir}/whisper-venv/` and pip-installs `faster-whisper`. Streams progress lines.
+- `installModel(name, onProgress)` / `deleteModel(name)` / `listInstalledModels()` — model management under `{data-dir}/whisper-models/` (HF cache layout). Known models: tiny.en, base.en, small.en, medium.en, large-v3, large-v3-turbo.
+- `whisper` (singleton `WhisperHelper`) — long-lived subprocess running `server/whisper/transcribe.py`. `start({model, device})` spawns it, `transcribe(audioBuffer)` sends base64-audio requests over stdin and reads JSON replies off stdout. `device: 'auto'` resolves to cuda when `nvidia-smi` succeeds, else cpu.
+
+### `server/whisper/transcribe.py`
+Long-lived helper process. Loads the faster-whisper model once on startup (env: `WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_MODEL_DIR`, optional `WHISPER_COMPUTE_TYPE`), emits `{"ready": true}`, then serves one JSON request per line on stdin (`{audio_b64, language}`) with one JSON reply per line on stdout (`{text}` or `{error}`).
 
 ### `server/sessions.js`
 `SessionManager` class (extends EventEmitter). Manages multiple pty instances.
@@ -192,10 +217,22 @@ Capacitor configuration. Key settings:
 - `server.allowNavigation: ['*']` — lets WebView navigate to server URLs (instead of opening browser)
 - `android.allowMixedContent: true` — allows WS over HTTP
 
-### `data/`
-Git-ignored directory for persistent user data. Key files:
-- `server-settings.json` — auth token, password hash, port, shell, update settings (settingsVersion 2)
+### `scripts/`
+Shell scripts auto-added to every pty's PATH (via `sessions.js:_makePtyEnv`) so Claude Code can invoke them directly from inside a session.
+- `speak` — Claude calls this at end of turn to produce TTS on the phone. POSTs to `/api/voice/speak`. See VOICE-PLAN.md.
+- `cmd` — Claude calls this to queue a slash command (`cmd clear` → queues `/clear`); server flushes to the pty when the Stop hook fires, so the slash command fires the moment Claude's turn ends.
+- `claude-hook-relay.sh` — legacy Notification hook relay; forwards Claude Code hook events to `/api/hooks/event` for status detection and Enter-injection auto-accept fallback.
+- `claude-preauth-hook.sh` — PreToolUse hook; consults `/api/hooks/preauth`. Server returns `{permissionDecision: "allow"}` when the session has auto-accept on, so permission prompts are never drawn. Much faster than the Notification-hook fallback.
+- `restart-dev.sh` — safely restarts the dev server (port 3034 only). Always use this instead of `pkill`.
+- `postinstall.js` — npm postinstall hook.
+
+### Data dir (`~/.claude-remote/` by default)
+Persistent user data, lives **outside the repo** so it survives `git pull` and update reinstalls. Default `~/.claude-remote/`, overridden by `CLAUDE_REMOTE_DATA` (prod uses `~/.claude-remote-prod/` or similar; dev uses `~/.claude-remote/`). A one-time migration (`migrateDataDir()` in `lib/paths.js`) moves legacy `./data/*.json` into the new location on first boot. Key files:
+- `server-settings.json` — auth token, password hash, port, shell, update settings, whisper config (settingsVersion 3)
+- `sessions.json` — per-session metadata (id, name, cwd, tabs, claudeSessionId) for revive after a server restart
 - `connection-info.json` — generated on startup with URLs and token
+- `whisper-venv/` — managed Python venv with `faster-whisper` installed (only if Whisper was bootstrapped)
+- `whisper-models/` — HuggingFace cache of installed Whisper models
 
 ---
 
@@ -203,10 +240,51 @@ Git-ignored directory for persistent user data. Key files:
 
 This project uses two instances running simultaneously:
 
-- **Prod** (`~/claude-remote-prod`, main branch): port 3033 — stable version, serves as the safety net
-- **Dev** (`~/claude-remote`, dev branch): port 3034 — active development
+- **Prod** (`~/claude-remote-prod`, main branch): port 3033 — protected by systemd, requires `sudo` to stop/restart
+- **Dev** (`~/claude-remote`, dev branch): port 3034 — active development, free to restart
 
 **NEVER kill the prod server on port 3033** unless the user explicitly asks. If the dev server breaks, prod keeps the user connected remotely.
+
+### Restarting the dev server
+
+**ALWAYS use the restart script** — do NOT manually kill processes or use `pkill`:
+
+```bash
+~/claude-remote/scripts/restart-dev.sh
+```
+
+This script safely stops the dev server (port 3034 only), starts it fresh via `run.sh`, and waits for it to come up. It will never touch prod.
+
+**DO NOT** use `pkill -f node`, `pkill -f server`, `kill` on PIDs, or any other method to restart dev. These approaches frequently kill the wrapper process too, leaving the server dead with no restart loop. The script handles all of this correctly.
+
+### Prod server management (requires sudo)
+
+```bash
+sudo systemctl status claude-remote    # check status
+sudo systemctl restart claude-remote   # restart
+sudo systemctl stop claude-remote      # stop (ONLY if user asks)
+sudo journalctl -u claude-remote -f    # view logs
+```
+
+### App Identity — Dev vs Prod (CRITICAL)
+
+The dev and prod APKs **MUST** have different Android application IDs so both can be installed on the same phone simultaneously.
+
+| | Dev (this repo) | Prod (`~/claude-remote-prod`, main branch) |
+|---|---|---|
+| **App ID** | `com.clauderemote.dev` | `com.clauderemote.app` |
+| **App Name** | `CR Dev` | `Claude Remote` |
+| **Icon BG** | Dark (`#1A1A2E`) | White (`#FFFFFF`) |
+| **Port** | 3034 | 3033 |
+
+These values are set in three places that **must stay in sync**:
+1. `client/capacitor.config.ts` — `appId` and `appName`
+2. `client/android/app/build.gradle` — `namespace` and `applicationId`
+3. `client/android/app/src/main/res/values/strings.xml` — `app_name`, `title_activity_main`, `package_name`, `custom_url_scheme`
+
+The Java source lives in `client/android/app/src/main/java/com/clauderemote/dev/` (dev) or `.../app/` (prod). The `package` declaration in each `.java` file must match the namespace.
+
+**NEVER change these values on the dev branch to match prod, or vice versa.** When merging dev→main, the app identity files must be reverted to prod values. When merging main→dev, they must be kept at dev values.
 
 ---
 
@@ -222,7 +300,7 @@ This project uses two instances running simultaneously:
 - Single `state` object in app.js. No store, no signals, just a plain object.
 - Settings subset persisted to localStorage via `saveSettings()`.
 - Server pushes session list every 3 seconds over WebSocket — client re-renders dashboard from that.
-- Server settings persisted to `data/server-settings.json` via `saveServerSettings()`.
+- Server settings persisted to `{data-dir}/server-settings.json` via `saveServerSettings()`.
 
 ### Adding a New View
 1. Add a `<template id="tpl-your-view">` in index.html
@@ -272,13 +350,16 @@ This project uses two instances running simultaneously:
 ## Known Issues / Incomplete
 
 - **Clean view heuristic is naive.** Currently just checks line length to guess what's Claude vs shell output. Could be much smarter — look for Claude Code's actual output framing patterns.
-- **Question detection patterns need tuning.** The regex list in `sessions.js` covers common prompts but misses some. Study Claude Code's actual output to refine.
-- **No session persistence across server restarts.** If the server restarts, all pty sessions are lost. Could serialize session state or at least session metadata.
-- **No file viewer in the app.** There's a file browser for picking directories when creating sessions, but no way to view/edit files from the phone. Could add a simple viewer.
-- **Capacitor plugins not yet wired.** The package.json includes `@capacitor/local-notifications`, `@capacitor/haptics`, etc. but app.js still uses the Web APIs (Notification, navigator.vibrate). Should use the Capacitor plugins for better Android support.
-- **No HTTPS.** Server is HTTP only. Tailscale encrypts the tunnel so this is fine for that use case, but if exposed directly, TLS should be added.
-- **No tests.** No test suite exists yet.
-- **Electron sandbox disabled.** Linux requires `ELECTRON_DISABLE_SANDBOX=1` due to chrome-sandbox permissions. Could fix by setting correct permissions on the sandbox binary.
+- **Question detection regex fallback is crude.** Hooks are primary now and work well; the regex fallback (for non-Claude sessions) still misses edge cases.
+- **Session persistence is partial.** Metadata (id, name, cwd, claudeSessionId, tab names) persists and sessions revive via `claude --resume`. What doesn't persist: terminal scrollback, running processes, bash pty state.
+- **No file viewer in the app.** The browser is picker-only. Could add a simple read/edit viewer.
+- **Capacitor plugin fallbacks.** Bootstrap (`client/bootstrap/index.html`) already uses `Capacitor.Plugins.LocalNotifications` and `Capacitor.Plugins.Haptics` for attention alerts in the Android app — this is the critical path and it works. `app.js` still has Web API fallbacks (`navigator.vibrate`, `new Notification`) for browser-mode. Migrating those fallbacks to also call through the bridge would be consistency cleanup, not a reliability fix.
+- **No HTTPS.** Server is HTTP only. Tailscale encrypts the tunnel so this is fine for the intended use case. Needed only for real audio-reactive waveform (`getUserMedia`) — not for TTS (native bridge) or STT (Android system).
+- **No tests.** No automated test suite. Voice-command parser, hook handlers, and revive flow would be the first to cover.
+- **Electron sandbox disabled.** Linux requires `ELECTRON_DISABLE_SANDBOX=1` due to chrome-sandbox permissions. Fixable by setting correct permissions on the sandbox binary.
+- **Hands-free permission approval.** If auto-accept is off and Claude hits a permission prompt, there's no voice path to approve a single prompt. User has to tap or toggle auto-accept on.
+- **No continuous / wake-word listening.** Push-to-talk only. Continuous mode would need a trigger phrase, confidence threshold, and self-muting while TTS plays.
+- **Structured output mode (`claude -p --output-format stream-json`).** Would replace pty parsing with a clean JSON stream. Blocked on Anthropic adding subscription support (currently API-key only).
 
 ---
 
