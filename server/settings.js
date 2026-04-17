@@ -29,7 +29,13 @@ const DEFAULTS = {
     model: null,           // installed model name, e.g. "small.en"
     device: 'auto',        // "auto" | "cpu" | "cuda"
   },
-  settingsVersion: 3,
+  tts: {
+    enabled: false,        // master toggle for server-side Kokoro TTS
+    voice: null,           // one of KNOWN_VOICES from tts-manager.js, e.g. "af_bella"
+    device: 'auto',        // "auto" | "cpu" | "cuda"
+    speed: 1.0,            // 0.5 – 2.0
+  },
+  settingsVersion: 4,
 };
 
 // ── Migrations ──────────────────────────────────────────────
@@ -44,6 +50,11 @@ const MIGRATIONS = {
   2: (settings) => {
     settings.whisper = settings.whisper || { enabled: false, model: null, device: 'auto' };
     settings.settingsVersion = 3;
+    return settings;
+  },
+  3: (settings) => {
+    settings.tts = settings.tts || { enabled: false, voice: null, device: 'auto', speed: 1.0 };
+    settings.settingsVersion = 4;
     return settings;
   },
 };

@@ -215,6 +215,10 @@
         <div><span class="setting-name">Server</span><br><span class="setting-desc" id="setting-server-url">—</span></div>
         <button class="btn-secondary btn-sm" id="btn-disconnect" style="color:var(--red);border-color:var(--red-border);">Disconnect</button>
       </div>
+      <div class="setting-row">
+        <div><span class="setting-name">Server admin</span><br><span class="setting-desc">Manage password, Whisper STT, Kokoro TTS, restart</span></div>
+        <button class="btn-secondary btn-sm" id="btn-open-admin">Open</button>
+      </div>
     </div>
 
     <div class="setting-group">
@@ -239,6 +243,11 @@
       </div>
     </div>
   </div>
+</template>
+
+<!-- Admin View (iframe wrapper) -->
+<template id="tpl-admin">
+  <iframe id="admin-frame" style="border:0;width:100%;height:100%;background:var(--bg-1);display:block"></iframe>
 </template>
 
 <script type="module" src="js/app.js"></script>

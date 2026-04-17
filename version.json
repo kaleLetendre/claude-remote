@@ -1,8 +1,17 @@
 {
-  "version": "0.3.4",
-  "settingsVersion": 3,
+  "version": "0.4.0",
+  "settingsVersion": 4,
   "minClientVersion": "0.3.4",
   "changelog": [
+    {
+      "version": "0.4.0",
+      "date": "2026-04-13",
+      "changes": [
+        "Server-side Kokoro TTS — optional natural neural voice, replaces robotic Android TTS",
+        "Admin panel: install kokoro-onnx + model/voices in one click, pick voice and speed",
+        "Falls back to Android system TTS when disabled or synth fails"
+      ]
+    },
     {
       "version": "0.3.3",
       "date": "2026-04-12",

@@ -27,6 +27,7 @@ const state = {
   // Runtime
   voiceMode: false,
   whisperEnabled: false,  // server-side Whisper STT availability (fetched on voice-mode enter)
+  ttsEnabled: false,      // server-side Kokoro TTS availability (same source, used for awareness only)
   voiceRecording: false,
   xterm: null,
   fitAddon: null,
@@ -400,6 +401,12 @@ function handleWSMessage(msg) {
       }
       break;
 
+    case 'speak-audio':
+      if (state.voiceMode && msg.sessionId === state.activeSessionId && msg.audio_b64) {
+        playSpeakAudio(msg.audio_b64, msg.format);
+      }
+      break;
+
     case 'session:attention': {
       // Update session status immediately
       const s = state.sessions.find(s => s.id === msg.sessionId);
@@ -618,6 +625,15 @@ function navigate(view, params = {}) {
       label.textContent = 'Settings';
       main.appendChild(cloneTemplate('tpl-settings'));
       initSettings();
+      break;
+
+    case 'admin':
+      backBtn.classList.remove('hidden');
+      $('#btn-voice-mode')?.classList.add('hidden');
+      $('#btn-auto-accept')?.classList.add('hidden');
+      label.textContent = 'Server admin';
+      main.appendChild(cloneTemplate('tpl-admin'));
+      initAdminFrame();
       break;
 
     case 'connect':
@@ -1149,13 +1165,16 @@ function switchTab(tabId) {
   renderTabBar();
 }
 
-// Fetches the server's voice status so we know whether to record audio for Whisper.
+// Fetches the server's voice status so we know whether to record audio for Whisper
+// and whether to expect server-synthesized audio from Kokoro TTS.
 async function refreshWhisperStatus() {
   try {
     const res = await api.get('/api/voice/status');
     state.whisperEnabled = !!res.whisperEnabled;
+    state.ttsEnabled = !!res.ttsEnabled;
   } catch {
     state.whisperEnabled = false;
+    state.ttsEnabled = false;
   }
 }
 
@@ -1645,6 +1664,42 @@ function clearWaveform() {
 
 // ── Voice TTS ───────────────────────────────
 
+// Play a base64-encoded audio blob from server-side Kokoro TTS.
+// The WebView's default <audio> element routes through Android media stream,
+// so Bluetooth / headphones behave the same as native TTS.
+let _lastSpeakAudio = null;
+
+function playSpeakAudio(b64, format) {
+  console.log('[voice] playing kokoro audio, format=', format, 'size=', b64.length);
+  try {
+    const bin = atob(b64);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    const mime = format === 'wav' ? 'audio/wav' : 'audio/mpeg';
+    const blob = new Blob([arr], { type: mime });
+    const url = URL.createObjectURL(blob);
+
+    // Stop any previous playback so successive speak calls don't overlap.
+    if (_lastSpeakAudio) {
+      try { _lastSpeakAudio.pause(); URL.revokeObjectURL(_lastSpeakAudio.src); } catch {}
+    }
+    const audio = new Audio(url);
+    _lastSpeakAudio = audio;
+    audio.onended = () => {
+      URL.revokeObjectURL(url);
+      playChime('idle');
+      if (_lastSpeakAudio === audio) _lastSpeakAudio = null;
+    };
+    audio.onerror = (e) => {
+      console.error('[voice] audio error', e);
+      URL.revokeObjectURL(url);
+    };
+    audio.play().catch((e) => console.error('[voice] audio.play rejected:', e));
+  } catch (e) {
+    console.error('[voice] playSpeakAudio failed:', e);
+  }
+}
+
 function speakVoice(text) {
   console.log('[voice] speaking:', text.slice(0, 80));
 
@@ -2069,6 +2124,14 @@ function dismissAttention() {
 
 // ── Settings View ───────────────────────────────────────────
 
+function initAdminFrame() {
+  const frame = $('#admin-frame');
+  if (!frame) return;
+  const base = state.serverUrl || location.origin;
+  const token = encodeURIComponent(state.token || '');
+  frame.src = `${base}/admin?token=${token}`;
+}
+
 function initSettings() {
   // Toggles
   $$('.toggle-switch').forEach(toggle => {
@@ -2087,6 +2150,12 @@ function initSettings() {
   // Server URL display
   const serverUrl = $('#setting-server-url');
   if (serverUrl) serverUrl.textContent = state.serverUrl || location.origin;
+
+  // Open admin panel (iframed into the app)
+  const openAdminBtn = $('#btn-open-admin');
+  if (openAdminBtn) {
+    openAdminBtn.onclick = () => navigate('admin');
+  }
 
   // Version + Git info
   // Disconnect button

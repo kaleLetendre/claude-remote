@@ -118,7 +118,8 @@ Main entry point. Sets up Express, WebSocket, routes. Key sections:
 - REST routes: `/api/sessions`, `/api/files`, `/api/info`, `/api/version`, `/api/update/*`, `/api/restart`
 - Admin routes: `/api/admin/status`, `/api/admin/password`, `/api/admin/token`
 - Whisper admin routes: `/api/admin/whisper/status`, `/api/admin/whisper/bootstrap`, `/api/admin/whisper/install`, `/api/admin/whisper/models/:name` (DELETE), `/api/admin/whisper/config`
-- Voice routes: `/api/voice/speak`, `/api/cmd/queue`, `/api/voice/status`, `/api/voice/transcribe` (server-side Whisper STT)
+- TTS admin routes: `/api/admin/tts/status`, `/api/admin/tts/bootstrap`, `/api/admin/tts/config`, `/api/admin/tts/preview`
+- Voice routes: `/api/voice/speak` (routes through Kokoro when enabled, else Android TTS broadcast), `/api/cmd/queue`, `/api/voice/status` (returns `{whisperEnabled, ttsEnabled}`), `/api/voice/transcribe` (server-side Whisper STT)
 - APK distribution: `/api/app/version` (unauthenticated), `/api/app/download`
 - WebSocket message types: `subscribe`, `unsubscribe`, `input`, `resize`, `list`, `ping`
 - Tracks connected WS clients in `connectedClients` Map (IP, connect time, subscribed session)
@@ -131,8 +132,8 @@ Canonical path resolution. `getDataDir()` returns `CLAUDE_REMOTE_DATA` if set, e
 ### `server/settings.js`
 Versioned settings with migration support and password hashing.
 - `PATHS` — canonical file locations (delegated to `lib/paths.js`, data is git-ignored and stored outside the repo by default)
-- `DEFAULTS` — default server settings including `authToken: null`, `password: null`, `whisper: { enabled, model, device }`
-- `MIGRATIONS` — v1→v2 (adds password), v2→v3 (adds `whisper` block). Current `settingsVersion` is **3**.
+- `DEFAULTS` — default server settings including `authToken: null`, `password: null`, `whisper: { enabled, model, device }`, `tts: { enabled, voice, device, speed }`
+- `MIGRATIONS` — v1→v2 (adds password), v2→v3 (adds `whisper` block), v3→v4 (adds `tts` block). Current `settingsVersion` is **4**.
 - `loadServerSettings()` — loads from file, applies env var overrides, runs migrations
 - `saveServerSettings()` — writes to `{data-dir}/server-settings.json`
 - `hashPassword(password)` — returns `{ hash, salt }` using `crypto.scryptSync`
@@ -147,6 +148,16 @@ Server-side Whisper STT stack (optional; defaults off). Lets operators run `fast
 
 ### `server/whisper/transcribe.py`
 Long-lived helper process. Loads the faster-whisper model once on startup (env: `WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_MODEL_DIR`, optional `WHISPER_COMPUTE_TYPE`), emits `{"ready": true}`, then serves one JSON request per line on stdin (`{audio_b64, language}`) with one JSON reply per line on stdout (`{text}` or `{error}`).
+
+### `server/tts-manager.js`
+Server-side Kokoro neural TTS stack (optional; defaults off). Mirrors the Whisper manager's structure.
+- Host capability detection: `findPython3()`, `isCudaAvailable()`, `isVenvReady()`, `isKokoroInstalled()`, `areAssetsInstalled()`, `isBootstrapped()`.
+- `bootstrap(onLog)` — one-click: create managed venv at `{data-dir}/tts-venv/`, pip-install `kokoro-onnx`, then curl-download `kokoro-v1.0.onnx` + `voices-v1.0.bin` into `{data-dir}/tts-model/`. Streams progress lines. Unlike Whisper, **there is no per-voice install** — the single voices bundle contains every Kokoro voice at once.
+- `KNOWN_VOICES` — curated subset of Kokoro's catalog: `af_bella`, `af_sarah`, `af_nicole`, `af_sky`, `am_adam`, `am_michael`, `bf_emma`, `bf_isabella`, `bm_george`, `bm_lewis` (a/b = American/British, f/m = female/male).
+- `tts` (singleton `TtsHelper`) — long-lived subprocess running `server/tts/synthesize.py`. `start({voice, device, speed})` spawns it, `synthesize(text)` sends a JSON request over stdin and reads a JSON reply off stdout. `device: 'auto'` resolves to cuda when `nvidia-smi` succeeds, else cpu.
+
+### `server/tts/synthesize.py`
+Long-lived helper process. Loads `kokoro-onnx` with the model + voices bundle once on startup (env: `KOKORO_VOICE`, `KOKORO_DEVICE`, `KOKORO_SPEED`, `KOKORO_MODEL_FILE`, `KOKORO_VOICES_FILE`), emits `{"ready": true}`, then serves one JSON request per line on stdin (`{text, voice?, speed?}`) with one JSON reply per line on stdout (`{audio_b64, format: "wav", ms}` or `{error}`). Audio is 16-bit PCM WAV at Kokoro's native sample rate.
 
 ### `server/sessions.js`
 `SessionManager` class (extends EventEmitter). Manages multiple pty instances.
@@ -228,11 +239,13 @@ Shell scripts auto-added to every pty's PATH (via `sessions.js:_makePtyEnv`) so 
 
 ### Data dir (`~/.claude-remote/` by default)
 Persistent user data, lives **outside the repo** so it survives `git pull` and update reinstalls. Default `~/.claude-remote/`, overridden by `CLAUDE_REMOTE_DATA` (prod uses `~/.claude-remote-prod/` or similar; dev uses `~/.claude-remote/`). A one-time migration (`migrateDataDir()` in `lib/paths.js`) moves legacy `./data/*.json` into the new location on first boot. Key files:
-- `server-settings.json` — auth token, password hash, port, shell, update settings, whisper config (settingsVersion 3)
+- `server-settings.json` — auth token, password hash, port, shell, update settings, whisper config, tts config (settingsVersion 4)
 - `sessions.json` — per-session metadata (id, name, cwd, tabs, claudeSessionId) for revive after a server restart
 - `connection-info.json` — generated on startup with URLs and token
 - `whisper-venv/` — managed Python venv with `faster-whisper` installed (only if Whisper was bootstrapped)
 - `whisper-models/` — HuggingFace cache of installed Whisper models
+- `tts-venv/` — managed Python venv with `kokoro-onnx` installed (only if Kokoro TTS was bootstrapped)
+- `tts-model/` — Kokoro ONNX model + voices bundle (`kokoro-v1.0.onnx`, `voices-v1.0.bin`)
 
 ---
 

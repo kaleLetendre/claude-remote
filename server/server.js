@@ -8,6 +8,7 @@ import os from 'os';
 import { SessionManager } from './sessions.js';
 import { Updater } from './updater.js';
 import * as whisperMgr from './whisper-manager.js';
+import * as ttsMgr from './tts-manager.js';
 import { loadServerSettings, saveServerSettings, hashPassword, verifyPassword } from './settings.js';
 import {
   PACKAGE_ROOT, getClientWwwDir, getConnectionInfoPath, getDataDir, ensureDataDir,
@@ -119,15 +120,27 @@ app.post('/api/cmd/queue', (req, res) => {
 // ── Voice speak relay (localhost only, no auth) ────────────────────────
 // Called by `scripts/speak` from inside a Claude Remote pty.
 // Forwards text to the app for TTS via a dedicated WS message.
-app.post('/api/voice/speak', (req, res) => {
+app.post('/api/voice/speak', async (req, res) => {
   const ip = req.socket.remoteAddress;
   if (ip !== '127.0.0.1' && ip !== '::1' && ip !== '::ffff:127.0.0.1') {
     return res.status(403).json({ error: 'Forbidden' });
   }
   const { sessionId, text } = req.body || {};
   if (!sessionId || !text) return res.status(400).json({ error: 'sessionId and text required' });
+
+  // Prefer server-side Kokoro TTS when available; fall back to client-side Android TTS.
+  if (settings.tts?.enabled && ttsMgr.tts.isRunning()) {
+    try {
+      const result = await ttsMgr.tts.synthesize(text);
+      sessions.emitSpeakAudio(sessionId, result.audio_b64, result.format || 'wav');
+      return res.json({ ok: true, engine: 'kokoro', ms: result.ms });
+    } catch (e) {
+      console.error('[tts] synth failed, falling back to Android TTS:', e.message);
+      // fall through to text broadcast
+    }
+  }
   sessions.emitSpeak(sessionId, text);
-  res.json({ ok: true });
+  res.json({ ok: true, engine: 'android' });
 });
 
 // ── Auth endpoints (no authCheck — these exchange password for token) ──
@@ -475,10 +488,106 @@ app.post('/api/admin/whisper/config', authCheck, async (req, res) => {
   }
 });
 
-// Client-facing: light status so app.js knows whether to record audio.
+// ── Kokoro TTS (server-side neural voice) ──────────────────────────
+
+app.get('/api/admin/tts/status', authCheck, (req, res) => {
+  res.json({
+    enabled: !!settings.tts?.enabled,
+    voice: settings.tts?.voice || null,
+    device: settings.tts?.device || 'auto',
+    speed: settings.tts?.speed ?? 1.0,
+    pythonAvailable: !!ttsMgr.findPython3(),
+    cudaAvailable: ttsMgr.isCudaAvailable(),
+    venvReady: ttsMgr.isVenvReady(),
+    kokoroInstalled: ttsMgr.isKokoroInstalled(),
+    assetsInstalled: ttsMgr.areAssetsInstalled(),
+    bootstrapped: ttsMgr.isBootstrapped(),
+    running: ttsMgr.tts.isRunning(),
+    currentConfig: ttsMgr.tts.currentConfig(),
+    knownVoices: ttsMgr.KNOWN_VOICES,
+  });
+});
+
+// Bootstrap: venv + kokoro-onnx + model/voices download. Streams progress.
+app.post('/api/admin/tts/bootstrap', authCheck, async (req, res) => {
+  if (!ttsMgr.findPython3()) return res.status(400).json({ error: 'Python 3 not found on PATH. Install python3 and retry.' });
+  res.json({ ok: true, message: 'Bootstrap started — watch tts:bootstrap-progress WS messages.' });
+  const broadcast = (line) => {
+    const msg = JSON.stringify({ type: 'tts:bootstrap-progress', line: line.toString().trim() });
+    for (const c of wss.clients) if (c.readyState === 1) c.send(msg);
+  };
+  try {
+    await ttsMgr.bootstrap(broadcast);
+    broadcast('__DONE__');
+  } catch (e) {
+    broadcast(`__ERROR__ ${e.message}`);
+  }
+});
+
+app.post('/api/admin/tts/config', authCheck, async (req, res) => {
+  const { enabled, voice, device, speed } = req.body || {};
+  let numericSpeed = parseFloat(speed);
+  if (!Number.isFinite(numericSpeed)) numericSpeed = 1.0;
+  numericSpeed = Math.max(0.5, Math.min(2.0, numericSpeed));
+  const nextTts = {
+    enabled: !!enabled,
+    voice: voice && ttsMgr.KNOWN_VOICES.includes(voice) ? voice : null,
+    device: ['auto', 'cpu', 'cuda'].includes(device) ? device : 'auto',
+    speed: numericSpeed,
+  };
+  settings.tts = nextTts;
+  saveServerSettings(settings);
+
+  try {
+    if (nextTts.enabled && nextTts.voice) {
+      await ttsMgr.tts.start({ voice: nextTts.voice, device: nextTts.device, speed: nextTts.speed });
+    } else {
+      await ttsMgr.tts.stop();
+    }
+    res.json({ ok: true, running: ttsMgr.tts.isRunning(), config: ttsMgr.tts.currentConfig() });
+  } catch (e) {
+    res.status(500).json({ error: e.message, running: ttsMgr.tts.isRunning() });
+  }
+});
+
+// Synthesize a short sample and return the audio blob for admin-panel preview.
+// Starts the helper on demand (or restarts with a different voice) so users can
+// audition voices before committing to "Save & apply".
+app.post('/api/admin/tts/preview', authCheck, async (req, res) => {
+  try {
+    if (!ttsMgr.isBootstrapped()) return res.status(400).json({ error: 'not bootstrapped — install TTS dependencies first' });
+    const { text, voice, device, speed } = req.body || {};
+    const sample = (text && String(text).slice(0, 400)) || 'The quick brown fox jumps over the lazy dog.';
+
+    const requestedVoice = voice && ttsMgr.KNOWN_VOICES.includes(voice) ? voice : settings.tts?.voice;
+    if (!requestedVoice) return res.status(400).json({ error: 'voice required — select one first' });
+    const requestedDevice = ['auto', 'cpu', 'cuda'].includes(device) ? device : (settings.tts?.device || 'auto');
+    let requestedSpeed = parseFloat(speed);
+    if (!Number.isFinite(requestedSpeed)) requestedSpeed = settings.tts?.speed ?? 1.0;
+    requestedSpeed = Math.max(0.5, Math.min(2.0, requestedSpeed));
+
+    // Start helper if not running, or restart if the config differs.
+    const current = ttsMgr.tts.currentConfig();
+    const configMatches = current
+      && current.voice === requestedVoice
+      && current.device === (requestedDevice === 'auto' ? (ttsMgr.isCudaAvailable() ? 'cuda' : 'cpu') : requestedDevice)
+      && current.speed === requestedSpeed;
+    if (!ttsMgr.tts.isRunning() || !configMatches) {
+      await ttsMgr.tts.start({ voice: requestedVoice, device: requestedDevice, speed: requestedSpeed });
+    }
+
+    const result = await ttsMgr.tts.synthesize(sample);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Client-facing: light status so app.js knows whether to record audio / expect audio playback.
 app.get('/api/voice/status', authCheck, (req, res) => {
   res.json({
     whisperEnabled: !!settings.whisper?.enabled && whisperMgr.whisper.isRunning(),
+    ttsEnabled: !!settings.tts?.enabled && ttsMgr.tts.isRunning(),
   });
 });
 
@@ -654,6 +763,14 @@ sessions.on('session:speak', (sessionId, text) => {
   }
 });
 
+// Server-synthesized Kokoro audio; client plays the WAV blob directly.
+sessions.on('session:speakAudio', (sessionId, audio_b64, format) => {
+  const msg = JSON.stringify({ type: 'speak-audio', sessionId, audio_b64, format });
+  for (const client of wss.clients) {
+    if (client.readyState === 1) client.send(msg);
+  }
+});
+
 // Periodic status broadcast (so dashboard stays fresh)
 setInterval(() => {
   if (wss.clients.size > 0) broadcastSessionList();
@@ -796,5 +913,13 @@ server.listen(PORT, '0.0.0.0', () => {
       .start({ model: settings.whisper.model, device: settings.whisper.device || 'auto' })
       .then(() => console.log(`[whisper] ready model=${settings.whisper.model} device=${settings.whisper.device}`))
       .catch((e) => console.error('[whisper] failed to start:', e.message));
+  }
+
+  // Start the Kokoro TTS helper if configured (best-effort; fall back to Android TTS on failure)
+  if (settings.tts?.enabled && settings.tts?.voice) {
+    ttsMgr.tts
+      .start({ voice: settings.tts.voice, device: settings.tts.device || 'auto', speed: settings.tts.speed || 1.0 })
+      .then(() => console.log(`[tts] ready voice=${settings.tts.voice} device=${settings.tts.device}`))
+      .catch((e) => console.error('[tts] failed to start:', e.message));
   }
 });

@@ -106,6 +106,10 @@ export class SessionManager extends EventEmitter {
     this.emit('session:speak', sessionId, text);
   }
 
+  emitSpeakAudio(sessionId, audio_b64, format) {
+    this.emit('session:speakAudio', sessionId, audio_b64, format);
+  }
+
   // Queue a slash command to be injected into the pty on the next Stop hook.
   // Used by `scripts/cmd` so Claude can fire slash commands at end of turn.
   queueCommand(sessionId, command) {

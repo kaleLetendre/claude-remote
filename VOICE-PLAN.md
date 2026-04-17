@@ -80,21 +80,55 @@ This tells Claude to run the `speak` shell script at end of turn. That's the mec
 
 ---
 
-## Output: `speak` shell script → WS → native TTS
+## Output: `speak` shell script → WS → TTS
 
 Instead of parsing Claude's terminal output for speech content (which was fragile — ANSI cleanup, markers, streaming races), we use a **side channel**:
 
 1. Claude runs `speak "summary text"` at end of turn.
 2. `scripts/speak` (on pty PATH via `sessions.js:_makePtyEnv`) POSTs to `POST /api/voice/speak` on localhost with `{sessionId, text}`.
-3. The server emits `session:speak` and broadcasts a dedicated WS message: `{type: "speak", sessionId, text}`.
-4. Client's `handleWSMessage` receives `speak`, calls `speakVoice(text)`.
-5. `speakVoice` sends the text to the bootstrap/Android bridge via `postMessage({type: "speak", text})`. Native Android TTS plays it through the media audio stream (follows headphones / car Bluetooth).
+3. The server picks a synthesis path (see below) and broadcasts a dedicated WS message.
+4. Client's `handleWSMessage` receives the message and plays the audio.
 
-Benefits vs. the old marker-based parser:
-- Text never touches the terminal stream — nothing to parse, no false positives.
+### Default path (Android system TTS)
+
+When server-side Kokoro is disabled (the default):
+
+- Server emits `session:speak` and broadcasts `{type: "speak", sessionId, text}`.
+- Client calls `speakVoice(text)`, which forwards text to the bootstrap/Android bridge via `postMessage({type: "speak", text})`.
+- Native Android TTS plays it through the media audio stream (follows headphones / car Bluetooth).
+
+Fast, always-available, works offline. Voice quality is the Android default — robotic but functional.
+
+### Optional path (Kokoro on the server)
+
+When the operator has enabled Kokoro from the admin panel:
+
+- Server calls `ttsMgr.tts.synthesize(text)`, getting back a WAV blob (base64).
+- Server emits `session:speakAudio` and broadcasts `{type: "speak-audio", sessionId, audio_b64, format: "wav"}`.
+- Client's `playSpeakAudio` decodes the blob, wraps it in a URL, and plays it via `new Audio()`. The WebView's `<audio>` element routes through the Android media stream, so Bluetooth / headphones behave identically to native TTS.
+- On synthesis failure the server falls back to the Android-TTS path automatically — no client-side coordination needed.
+
+Kokoro-82M produces natural, human-sounding voices at real-time speed on CPU (sub-second for typical summaries). See **Server-side Kokoro TTS** below.
+
+### Benefits of the side-channel design (both paths)
+
+- Text/audio never touches the terminal stream — nothing to parse, no false positives.
 - Works reliably regardless of Claude Code UI framing changes.
 - Shell-quoted strings in `speak "..."` survive exactly as intended.
 - Localhost-only endpoint + env-var-based auth (`CLAUDE_REMOTE_SESSION_ID` must be set) means only code running inside a Claude Remote pty can trigger TTS.
+
+---
+
+## Server-side Kokoro TTS
+
+Managed analogously to Whisper. Off by default.
+
+1. **Bootstrap** — `POST /api/admin/tts/bootstrap` creates a venv at `{data-dir}/tts-venv/`, installs `kokoro-onnx`, and downloads `kokoro-v1.0.onnx` + `voices-v1.0.bin` (~340 MB total) into `{data-dir}/tts-model/`. Progress streams over WS as `tts:bootstrap-progress` lines. Unlike Whisper, there is no per-voice install — the voices bundle contains every Kokoro voice at once.
+2. **Configure + enable** — `POST /api/admin/tts/config` with `{enabled, voice, device, speed}` persists to `server-settings.json` and boots a long-lived helper (`server/tts/synthesize.py`) via `TtsHelper.start()`. Voice comes from `KNOWN_VOICES` in `tts-manager.js` (af_bella, am_adam, bf_emma, …). Device `auto` resolves to cuda when `nvidia-smi` works, else cpu. Speed is clamped to [0.5, 2.0].
+3. **Preview** — `POST /api/admin/tts/preview` synthesizes a short sample so the operator can hear the voice without leaving the admin page.
+4. **Synthesize** — `POST /api/voice/speak` (from `scripts/speak` inside the pty) routes through the helper when TTS is enabled; otherwise falls through to the Android-TTS text broadcast.
+
+The helper process lives for the life of the server — the ONNX model is loaded once, so per-request latency is just inference cost.
 
 ---
 
@@ -181,6 +215,12 @@ This matters for voice because draw/dismiss round-trips were noticeable on mobil
 | Whisper transcribe endpoint | `server/server.js` — `/api/voice/transcribe` |
 | Parallel mic capture on phone | `client/www/js/app.js` — `_voiceMediaRecorder`, `transcribeWithWhisper` |
 | Whisper admin UI | `client/www/admin.html` — `#whisper-card` |
+| Server-side Kokoro TTS lifecycle | `server/tts-manager.js` |
+| Kokoro helper subprocess | `server/tts/synthesize.py` |
+| Kokoro admin endpoints | `server/server.js` — `/api/admin/tts/*` |
+| Kokoro audio broadcast | `server/server.js` — `session:speakAudio` → `speak-audio` WS |
+| Audio blob playback on phone | `client/www/js/app.js` — `playSpeakAudio` |
+| Kokoro admin UI | `client/www/admin.html` — `#tts-card` |
 
 ---
 
