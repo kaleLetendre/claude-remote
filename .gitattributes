@@ -1,0 +1,5 @@
+# App identity per branch — see .githooks/post-merge and CLAUDE.md
+# Files listed here always keep the current branch's version during a merge.
+# The `identityours` driver is registered by scripts/postinstall.js.
+client/capacitor.config.ts merge=identityours
+client/android/app/src/main/res/values/strings.xml merge=identityours
