@@ -5,8 +5,11 @@
 # This hook handles the two things gitattributes can't:
 #   1. build.gradle — must stay mergeable (contains shared syncAppVersion task),
 #      so we patch the identity fields in place based on the current branch.
-#   2. Java package dir — merge brings in the other branch's java/.../{app,dev}/
-#      as new files; we delete the orphan dir here.
+#   2. Java package dir — each branch stores MainActivity/AttentionPollerService
+#      under java/com/clauderemote/{app|dev}/. A merge brings in the OTHER
+#      branch's dir (with content changes we want to keep) and may delete the
+#      current branch's dir. We relocate the content into this branch's dir
+#      and rewrite the `package` declaration.
 #
 # If either fixup produces changes, we create a follow-up commit so the working
 # tree ends in a clean, pushable state. Never amends the merge commit.
@@ -21,11 +24,13 @@ case "$BRANCH" in
   main)
     WANT_ID="com.clauderemote.app"
     ORPHAN_ID="com.clauderemote.dev"
+    WANT_DIR="$JAVA_ROOT/app"
     ORPHAN_DIR="$JAVA_ROOT/dev"
     ;;
   dev)
     WANT_ID="com.clauderemote.dev"
     ORPHAN_ID="com.clauderemote.app"
+    WANT_DIR="$JAVA_ROOT/dev"
     ORPHAN_DIR="$JAVA_ROOT/app"
     ;;
   *)
@@ -43,11 +48,20 @@ if [ -f "$GRADLE" ] && grep -q "\"$ORPHAN_ID\"" "$GRADLE"; then
   CHANGED=1
 fi
 
-# 2. Delete the orphan Java package dir the merge brought over.
+# 2. Relocate Java files from the orphan package dir into this branch's dir.
+#    This preserves content changes (e.g., MainActivity edits) while keeping
+#    the correct on-disk path for the current branch's package namespace.
 if [ -d "$ORPHAN_DIR" ]; then
-  find "$ORPHAN_DIR" -type f -delete
+  mkdir -p "$WANT_DIR"
+  for src in "$ORPHAN_DIR"/*; do
+    [ -f "$src" ] || continue
+    dest="$WANT_DIR/$(basename "$src")"
+    mv "$src" "$dest"
+  done
   find "$ORPHAN_DIR" -type d -empty -delete
-  echo "[identity] removed orphan $ORPHAN_DIR"
+  # Rewrite `package com.clauderemote.<other>;` → current branch's package
+  find "$WANT_DIR" -name "*.java" -exec sed -i "s/package $ORPHAN_ID;/package $WANT_ID;/g" {} \;
+  echo "[identity] relocated java from $ORPHAN_DIR → $WANT_DIR"
   CHANGED=1
 fi
 
