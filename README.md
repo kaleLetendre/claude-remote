@@ -126,8 +126,9 @@ Toggle between two modes:
 Voice mode is a dedicated overlay, not a setting. Open a session, toggle voice mode, and:
 
 1. **Push and hold the talk button** — speech is transcribed via Android SpeechRecognition, sent to Claude when you release.
-2. **Claude responds via native Android TTS** — Claude runs `speak "summary"` at end of turn, the phone plays it through the system TTS engine (routes through media audio, so Bluetooth / headphones work).
+2. **Claude responds via TTS** — Claude runs `speak "summary"` at end of turn. By default this plays through the phone's native Android TTS engine (routes through media audio, so Bluetooth / headphones work).
    - **Optional server-side Whisper STT** — from the admin panel, install `faster-whisper` into a managed venv, download a model, and enable it. The phone then captures audio in parallel and prefers the Whisper transcript when it lands before the user dispatches; Android STT remains the fallback if Whisper is slow or disabled.
+   - **Optional server-side Kokoro TTS** — from the admin panel, one-click bootstrap installs `kokoro-onnx` into a managed venv and downloads the model + voices bundle. Pick a voice (e.g. `af_bella`, `bm_george`) and speed; `speak` then routes through Kokoro for natural neural output instead of the robotic Android voice. Falls back to Android TTS if disabled or synth fails.
 3. **Hands-free slash commands** — say `"system command <name>"` to fire any slash command without the voice wrapper. Examples: *"system command clear"*, *"system command compact"*, *"system command cost"*, *"system command model opus"*, *"system command stop"* (Ctrl+C). For informational commands like `/cost` the client auto-summarizes the output via TTS.
 
 Target use case: hands-free **emergency server ops** (restart a service, flush a cache, roll back a deploy) while driving or away from the desk. Define domain operations as Claude Code skills — they auto-wire as voice commands via the "system command" prefix.
@@ -159,6 +160,10 @@ Server settings are stored in `~/.claude-remote/server-settings.json` (auto-gene
 | `whisper.enabled` | `false` | Use server-side Whisper STT instead of Android-only |
 | `whisper.model` | `null` | Installed model name (e.g. `small.en`, `large-v3-turbo`) |
 | `whisper.device` | `auto` | `auto` / `cpu` / `cuda` |
+| `tts.enabled` | `false` | Route `speak` through server-side Kokoro TTS instead of Android TTS |
+| `tts.voice` | `af_bella` | Kokoro voice (e.g. `af_bella`, `af_sarah`, `am_michael`, `bm_george`) |
+| `tts.device` | `auto` | `auto` / `cpu` / `cuda` |
+| `tts.speed` | `1.0` | Playback speed multiplier |
 
 Environment variable overrides:
 
@@ -222,6 +227,8 @@ claude-remote/
 │   ├── settings.js               # Versioned settings with migration support
 │   ├── whisper-manager.js        # Server-side Whisper lifecycle (venv, models, helper)
 │   ├── whisper/transcribe.py     # Long-lived faster-whisper helper (JSON over stdio)
+│   ├── tts-manager.js            # Server-side Kokoro TTS lifecycle (venv, model, helper)
+│   ├── tts/synthesize.py         # Long-lived kokoro-onnx helper (JSON over stdio)
 │   └── package.json
 ├── client/
 │   ├── bootstrap/                # Login screen (bundled in APK)
@@ -252,11 +259,13 @@ Persistent user data lives **outside the repo** at `~/.claude-remote/` (override
 
 ```
 ~/.claude-remote/
-├── server-settings.json          # auth token, password, port, shell, whisper config
+├── server-settings.json          # auth token, password, port, shell, whisper + tts config
 ├── sessions.json                 # session metadata for revive
 ├── connection-info.json          # URLs + token, regenerated each boot
 ├── whisper-venv/                 # managed Python venv (only if Whisper bootstrapped)
-└── whisper-models/               # installed Whisper models (HF cache)
+├── whisper-models/               # installed Whisper models (HF cache)
+├── tts-venv/                     # managed Python venv (only if Kokoro TTS bootstrapped)
+└── tts-model/                    # Kokoro ONNX model + voices bundle
 ```
 
 ## Updates
