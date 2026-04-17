@@ -1,0 +1,25 @@
+#!/bin/bash
+# Usage: speak "text to speak"
+# POSTs text to Claude Remote's voice endpoint; the app speaks it via TTS.
+# Only works inside a Claude Remote pty (requires CLAUDE_REMOTE_SESSION_ID env var).
+
+[ -z "$CLAUDE_REMOTE_SESSION_ID" ] && exit 0
+[ -z "$1" ] && exit 0
+
+PORT="${CLAUDE_REMOTE_PORT:-3033}"
+
+# JSON-encode the text safely. Prefer jq, fall back to node, then python3.
+if command -v jq >/dev/null 2>&1; then
+  BODY=$(jq -Rn --arg s "$CLAUDE_REMOTE_SESSION_ID" --arg t "$1" '{sessionId:$s, text:$t}')
+elif command -v node >/dev/null 2>&1; then
+  BODY=$(CR_S="$CLAUDE_REMOTE_SESSION_ID" CR_T="$1" node -e 'process.stdout.write(JSON.stringify({sessionId:process.env.CR_S,text:process.env.CR_T}))')
+elif command -v python3 >/dev/null 2>&1; then
+  BODY=$(CR_S="$CLAUDE_REMOTE_SESSION_ID" CR_T="$1" python3 -c 'import os,json; print(json.dumps({"sessionId":os.environ["CR_S"],"text":os.environ["CR_T"]}))')
+else
+  exit 0
+fi
+
+curl -s -X POST "http://localhost:${PORT}/api/voice/speak" \
+  -H "Content-Type: application/json" \
+  -d "$BODY" \
+  --max-time 2 >/dev/null 2>&1

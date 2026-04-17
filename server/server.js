@@ -7,6 +7,8 @@ import crypto from 'crypto';
 import os from 'os';
 import { SessionManager } from './sessions.js';
 import { Updater } from './updater.js';
+import * as whisperMgr from './whisper-manager.js';
+import * as ttsMgr from './tts-manager.js';
 import { loadServerSettings, saveServerSettings, hashPassword, verifyPassword } from './settings.js';
 import {
   PACKAGE_ROOT, getClientWwwDir, getConnectionInfoPath, getDataDir, ensureDataDir,
@@ -39,7 +41,7 @@ updater.on('update-available', (info) => {
   }
 });
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));  // allow base64 audio blobs for /api/voice/transcribe
 
 // CORS — allow Capacitor WebView (capacitor://localhost) and any origin
 app.use((req, res, next) => {
@@ -77,6 +79,68 @@ app.post('/api/hooks/event', (req, res) => {
   const { hookType, sessionId, data } = req.body;
   sessions.handleHookEvent(hookType, sessionId, data);
   res.json({ ok: true });
+});
+
+// ── PreToolUse preauth (localhost only, no auth) ─────────────────────
+// Synchronous decision endpoint. The PreToolUse hook calls this and prints
+// the JSON response to stdout, which Claude Code honors as an approve/deny decision.
+// Returns an "allow" decision if the session has autoAccept enabled, otherwise {}.
+app.post('/api/hooks/preauth', (req, res) => {
+  const ip = req.socket.remoteAddress;
+  if (ip !== '127.0.0.1' && ip !== '::1' && ip !== '::ffff:127.0.0.1') {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  const { sessionId } = req.body || {};
+  if (sessionId && sessions.getAutoAccept(sessionId)) {
+    return res.json({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'allow',
+        permissionDecisionReason: 'Claude Remote auto-accept enabled',
+      },
+    });
+  }
+  res.json({});
+});
+
+// ── Claude-driven slash-command queue (localhost only, no auth) ────────
+// Called by `scripts/cmd` from inside a Claude Remote pty.
+// Queued commands are flushed into the pty when the Stop hook fires.
+app.post('/api/cmd/queue', (req, res) => {
+  const ip = req.socket.remoteAddress;
+  if (ip !== '127.0.0.1' && ip !== '::1' && ip !== '::ffff:127.0.0.1') {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  const { sessionId, command } = req.body || {};
+  if (!sessionId || !command) return res.status(400).json({ error: 'sessionId and command required' });
+  sessions.queueCommand(sessionId, command);
+  res.json({ ok: true });
+});
+
+// ── Voice speak relay (localhost only, no auth) ────────────────────────
+// Called by `scripts/speak` from inside a Claude Remote pty.
+// Forwards text to the app for TTS via a dedicated WS message.
+app.post('/api/voice/speak', async (req, res) => {
+  const ip = req.socket.remoteAddress;
+  if (ip !== '127.0.0.1' && ip !== '::1' && ip !== '::ffff:127.0.0.1') {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  const { sessionId, text } = req.body || {};
+  if (!sessionId || !text) return res.status(400).json({ error: 'sessionId and text required' });
+
+  // Prefer server-side Kokoro TTS when available; fall back to client-side Android TTS.
+  if (settings.tts?.enabled && ttsMgr.tts.isRunning()) {
+    try {
+      const result = await ttsMgr.tts.synthesize(text);
+      sessions.emitSpeakAudio(sessionId, result.audio_b64, result.format || 'wav');
+      return res.json({ ok: true, engine: 'kokoro', ms: result.ms });
+    } catch (e) {
+      console.error('[tts] synth failed, falling back to Android TTS:', e.message);
+      // fall through to text broadcast
+    }
+  }
+  sessions.emitSpeak(sessionId, text);
+  res.json({ ok: true, engine: 'android' });
 });
 
 // ── Auth endpoints (no authCheck — these exchange password for token) ──
@@ -133,7 +197,9 @@ app.patch('/api/sessions/:id', authCheck, (req, res) => {
 // Reconnect a dead session (spawns new pty in same directory)
 app.post('/api/sessions/:id/reconnect', authCheck, (req, res) => {
   try {
-    const session = sessions.reconnect(req.params.id);
+    const resumeClaude = req.body?.resumeClaude ?? false;
+    const claudeSessionId = req.body?.claudeSessionId || null;
+    const session = sessions.reconnect(req.params.id, { resumeClaude, claudeSessionId });
     res.json(session);
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -144,6 +210,45 @@ app.post('/api/sessions/:id/reconnect', authCheck, (req, res) => {
 app.delete('/api/sessions/:id', authCheck, (req, res) => {
   sessions.kill(req.params.id);
   res.json({ ok: true });
+});
+
+// Open session in a local terminal window
+app.post('/api/sessions/:id/open-terminal', authCheck, (req, res) => {
+  const session = sessions.get(req.params.id);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+
+  // Detect available terminal emulator
+  const terminals = ['gnome-terminal', 'kitty', 'alacritty', 'xfce4-terminal', 'konsole', 'xterm'];
+  let termCmd = null;
+  for (const t of terminals) {
+    try { execSync(`which ${t}`, { stdio: 'pipe' }); termCmd = t; break; } catch {}
+  }
+  if (!termCmd) return res.status(500).json({ error: 'No terminal emulator found' });
+
+  // Build the command to run inside the terminal
+  const resumeFlag = session.claudeSessionId ? `--resume ${session.claudeSessionId}` : '--resume';
+  const innerCmd = `cd ${JSON.stringify(session.cwd)} && claude ${resumeFlag}`;
+
+  // Spawn the terminal (detached so it outlives any request)
+  let spawnArgs;
+  switch (termCmd) {
+    case 'gnome-terminal': spawnArgs = ['--', 'bash', '-c', innerCmd]; break;
+    case 'kitty':          spawnArgs = ['bash', '-c', innerCmd]; break;
+    case 'alacritty':      spawnArgs = ['-e', 'bash', '-c', innerCmd]; break;
+    case 'xfce4-terminal': spawnArgs = ['-e', `bash -c ${JSON.stringify(innerCmd)}`]; break;
+    case 'konsole':        spawnArgs = ['-e', 'bash', '-c', innerCmd]; break;
+    case 'xterm':          spawnArgs = ['-e', 'bash', '-c', innerCmd]; break;
+    default:               spawnArgs = ['-e', 'bash', '-c', innerCmd];
+  }
+
+  const child = cpSpawn(termCmd, spawnArgs, {
+    detached: true,
+    stdio: 'ignore',
+    env: { ...process.env, DISPLAY: process.env.DISPLAY || ':0' },
+  });
+  child.unref();
+
+  res.json({ ok: true, terminal: termCmd, cwd: session.cwd });
 });
 
 // List directory
@@ -268,6 +373,224 @@ app.get('/api/admin/token', authCheck, (req, res) => {
   res.json({ token: AUTH_TOKEN });
 });
 
+// ── Whisper (server-side STT) ──────────────────────────────────────
+
+app.post('/api/voice/transcribe', authCheck, async (req, res) => {
+  try {
+    if (!settings.whisper?.enabled) {
+      console.log('[transcribe] rejected: whisper disabled');
+      return res.status(503).json({ error: 'whisper disabled' });
+    }
+    if (!whisperMgr.whisper.isRunning()) {
+      console.log('[transcribe] rejected: whisper not running');
+      return res.status(503).json({ error: 'whisper not running' });
+    }
+    const { audio_b64, language } = req.body || {};
+    if (!audio_b64) return res.status(400).json({ error: 'audio_b64 required' });
+    const buf = Buffer.from(audio_b64, 'base64');
+    console.log(`[transcribe] received ${buf.length} bytes`);
+    const result = await whisperMgr.whisper.transcribe(buf, { language: language || 'en', timeoutMs: 5000 });
+    console.log(`[transcribe] result: text="${result.text}" ms=${result.ms}`);
+    res.json(result);
+  } catch (e) {
+    console.log(`[transcribe] error: ${e.message}`);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/admin/whisper/status', authCheck, (req, res) => {
+  res.json({
+    enabled: !!settings.whisper?.enabled,
+    model: settings.whisper?.model || null,
+    device: settings.whisper?.device || 'auto',
+    pythonAvailable: !!whisperMgr.findPython3(),
+    cudaAvailable: whisperMgr.isCudaAvailable(),
+    ffmpegAvailable: whisperMgr.isFfmpegAvailable(),
+    venvReady: whisperMgr.isVenvReady(),
+    fasterWhisperInstalled: whisperMgr.isFasterWhisperInstalled(),
+    running: whisperMgr.whisper.isRunning(),
+    currentConfig: whisperMgr.whisper.currentConfig(),
+    knownModels: whisperMgr.KNOWN_MODELS,
+    installedModels: whisperMgr.listInstalledModels(),
+  });
+});
+
+// Bootstrap dependencies (venv + faster-whisper). Long-running; streams lines over WS.
+app.post('/api/admin/whisper/bootstrap', authCheck, async (req, res) => {
+  if (!whisperMgr.findPython3()) return res.status(400).json({ error: 'Python 3 not found on PATH. Install python3 and retry.' });
+  res.json({ ok: true, message: 'Bootstrap started — watch whisper:bootstrap-progress WS messages.' });
+  // Run async after response
+  const broadcast = (line) => {
+    const msg = JSON.stringify({ type: 'whisper:bootstrap-progress', line: line.toString().trim() });
+    for (const c of wss.clients) if (c.readyState === 1) c.send(msg);
+  };
+  try {
+    await whisperMgr.bootstrap(broadcast);
+    broadcast('__DONE__');
+  } catch (e) {
+    broadcast(`__ERROR__ ${e.message}`);
+  }
+});
+
+app.post('/api/admin/whisper/install', authCheck, async (req, res) => {
+  const { model } = req.body || {};
+  if (!model) return res.status(400).json({ error: 'model required' });
+  if (!whisperMgr.KNOWN_MODELS.includes(model)) return res.status(400).json({ error: 'unknown model' });
+  if (!whisperMgr.isFasterWhisperInstalled()) return res.status(400).json({ error: 'faster-whisper not installed — bootstrap first' });
+  res.json({ ok: true, message: `Installing ${model} — watch whisper:install-progress WS messages.` });
+
+  const broadcast = (line) => {
+    const msg = JSON.stringify({ type: 'whisper:install-progress', model, line: line.toString().trim() });
+    for (const c of wss.clients) if (c.readyState === 1) c.send(msg);
+  };
+  try {
+    await whisperMgr.installModel(model, broadcast);
+    broadcast('__DONE__');
+  } catch (e) {
+    broadcast(`__ERROR__ ${e.message}`);
+  }
+});
+
+app.delete('/api/admin/whisper/models/:name', authCheck, (req, res) => {
+  try {
+    const name = req.params.name;
+    // If this model is currently loaded, stop the helper first.
+    if (whisperMgr.whisper.currentConfig()?.model === name) {
+      whisperMgr.whisper.stop();
+    }
+    whisperMgr.deleteModel(name);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/whisper/config', authCheck, async (req, res) => {
+  const { enabled, model, device } = req.body || {};
+  const nextWhisper = {
+    enabled: !!enabled,
+    model: model || null,
+    device: ['auto', 'cpu', 'cuda'].includes(device) ? device : 'auto',
+  };
+  settings.whisper = nextWhisper;
+  saveServerSettings(settings);
+
+  // Sync helper state
+  try {
+    if (nextWhisper.enabled && nextWhisper.model) {
+      await whisperMgr.whisper.start({ model: nextWhisper.model, device: nextWhisper.device });
+    } else {
+      await whisperMgr.whisper.stop();
+    }
+    res.json({ ok: true, running: whisperMgr.whisper.isRunning(), config: whisperMgr.whisper.currentConfig() });
+  } catch (e) {
+    res.status(500).json({ error: e.message, running: whisperMgr.whisper.isRunning() });
+  }
+});
+
+// ── Kokoro TTS (server-side neural voice) ──────────────────────────
+
+app.get('/api/admin/tts/status', authCheck, (req, res) => {
+  res.json({
+    enabled: !!settings.tts?.enabled,
+    voice: settings.tts?.voice || null,
+    device: settings.tts?.device || 'auto',
+    speed: settings.tts?.speed ?? 1.0,
+    pythonAvailable: !!ttsMgr.findPython3(),
+    cudaAvailable: ttsMgr.isCudaAvailable(),
+    venvReady: ttsMgr.isVenvReady(),
+    kokoroInstalled: ttsMgr.isKokoroInstalled(),
+    assetsInstalled: ttsMgr.areAssetsInstalled(),
+    bootstrapped: ttsMgr.isBootstrapped(),
+    running: ttsMgr.tts.isRunning(),
+    currentConfig: ttsMgr.tts.currentConfig(),
+    knownVoices: ttsMgr.KNOWN_VOICES,
+  });
+});
+
+// Bootstrap: venv + kokoro-onnx + model/voices download. Streams progress.
+app.post('/api/admin/tts/bootstrap', authCheck, async (req, res) => {
+  if (!ttsMgr.findPython3()) return res.status(400).json({ error: 'Python 3 not found on PATH. Install python3 and retry.' });
+  res.json({ ok: true, message: 'Bootstrap started — watch tts:bootstrap-progress WS messages.' });
+  const broadcast = (line) => {
+    const msg = JSON.stringify({ type: 'tts:bootstrap-progress', line: line.toString().trim() });
+    for (const c of wss.clients) if (c.readyState === 1) c.send(msg);
+  };
+  try {
+    await ttsMgr.bootstrap(broadcast);
+    broadcast('__DONE__');
+  } catch (e) {
+    broadcast(`__ERROR__ ${e.message}`);
+  }
+});
+
+app.post('/api/admin/tts/config', authCheck, async (req, res) => {
+  const { enabled, voice, device, speed } = req.body || {};
+  let numericSpeed = parseFloat(speed);
+  if (!Number.isFinite(numericSpeed)) numericSpeed = 1.0;
+  numericSpeed = Math.max(0.5, Math.min(2.0, numericSpeed));
+  const nextTts = {
+    enabled: !!enabled,
+    voice: voice && ttsMgr.KNOWN_VOICES.includes(voice) ? voice : null,
+    device: ['auto', 'cpu', 'cuda'].includes(device) ? device : 'auto',
+    speed: numericSpeed,
+  };
+  settings.tts = nextTts;
+  saveServerSettings(settings);
+
+  try {
+    if (nextTts.enabled && nextTts.voice) {
+      await ttsMgr.tts.start({ voice: nextTts.voice, device: nextTts.device, speed: nextTts.speed });
+    } else {
+      await ttsMgr.tts.stop();
+    }
+    res.json({ ok: true, running: ttsMgr.tts.isRunning(), config: ttsMgr.tts.currentConfig() });
+  } catch (e) {
+    res.status(500).json({ error: e.message, running: ttsMgr.tts.isRunning() });
+  }
+});
+
+// Synthesize a short sample and return the audio blob for admin-panel preview.
+// Starts the helper on demand (or restarts with a different voice) so users can
+// audition voices before committing to "Save & apply".
+app.post('/api/admin/tts/preview', authCheck, async (req, res) => {
+  try {
+    if (!ttsMgr.isBootstrapped()) return res.status(400).json({ error: 'not bootstrapped — install TTS dependencies first' });
+    const { text, voice, device, speed } = req.body || {};
+    const sample = (text && String(text).slice(0, 400)) || 'The quick brown fox jumps over the lazy dog.';
+
+    const requestedVoice = voice && ttsMgr.KNOWN_VOICES.includes(voice) ? voice : settings.tts?.voice;
+    if (!requestedVoice) return res.status(400).json({ error: 'voice required — select one first' });
+    const requestedDevice = ['auto', 'cpu', 'cuda'].includes(device) ? device : (settings.tts?.device || 'auto');
+    let requestedSpeed = parseFloat(speed);
+    if (!Number.isFinite(requestedSpeed)) requestedSpeed = settings.tts?.speed ?? 1.0;
+    requestedSpeed = Math.max(0.5, Math.min(2.0, requestedSpeed));
+
+    // Start helper if not running, or restart if the config differs.
+    const current = ttsMgr.tts.currentConfig();
+    const configMatches = current
+      && current.voice === requestedVoice
+      && current.device === (requestedDevice === 'auto' ? (ttsMgr.isCudaAvailable() ? 'cuda' : 'cpu') : requestedDevice)
+      && current.speed === requestedSpeed;
+    if (!ttsMgr.tts.isRunning() || !configMatches) {
+      await ttsMgr.tts.start({ voice: requestedVoice, device: requestedDevice, speed: requestedSpeed });
+    }
+
+    const result = await ttsMgr.tts.synthesize(sample);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Client-facing: light status so app.js knows whether to record audio / expect audio playback.
+app.get('/api/voice/status', authCheck, (req, res) => {
+  res.json({
+    whisperEnabled: !!settings.whisper?.enabled && whisperMgr.whisper.isRunning(),
+    ttsEnabled: !!settings.tts?.enabled && ttsMgr.tts.isRunning(),
+  });
+});
+
 // Client settings schema (for migrations)
 app.get('/api/settings-schema', authCheck, (req, res) => {
   try {
@@ -318,46 +641,69 @@ wss.on('connection', (ws, req) => {
   connectedClients.set(ws, { ip: clientIp, connectedAt: Date.now(), subscribedSession: null });
 
   let subscribedSession = null;
+  let subscribedTab = null;
 
   ws.on('message', (raw) => {
     try {
       const msg = JSON.parse(raw);
 
       switch (msg.type) {
-        // Subscribe to a session's output stream
+        // Subscribe to a session tab's output stream
         case 'subscribe': {
           // Unsub from previous
           if (subscribedSession) {
-            sessions.unsubscribe(subscribedSession, ws);
+            sessions.unsubscribe(subscribedSession, ws, subscribedTab);
           }
-          sessions.subscribe(msg.sessionId, ws);
+          const actualTabId = sessions.subscribe(msg.sessionId, ws, msg.tabId);
           subscribedSession = msg.sessionId;
+          subscribedTab = actualTabId;
           const clientInfo = connectedClients.get(ws);
           if (clientInfo) clientInfo.subscribedSession = msg.sessionId;
-          console.log(`[ws] client subscribed to ${msg.sessionId}`);
-          ws.send(JSON.stringify({ type: 'subscribed', sessionId: msg.sessionId }));
+          console.log(`[ws] client subscribed to ${msg.sessionId} tab=${actualTabId}`);
+          ws.send(JSON.stringify({ type: 'subscribed', sessionId: msg.sessionId, tabId: actualTabId }));
           break;
         }
 
         // Unsubscribe
         case 'unsubscribe': {
           if (subscribedSession) {
-            sessions.unsubscribe(subscribedSession, ws);
+            sessions.unsubscribe(subscribedSession, ws, subscribedTab);
             subscribedSession = null;
+            subscribedTab = null;
           }
           break;
         }
 
-        // Send input to a session
+        // Send input to a session tab
         case 'input': {
-          console.log(`[ws] input to ${msg.sessionId}: ${JSON.stringify(msg.data).slice(0, 50)}`);
-          sessions.write(msg.sessionId, msg.data);
+          console.log(`[ws] input to ${msg.sessionId}/${msg.tabId || 'main'}: ${JSON.stringify(msg.data).slice(0, 50)}`);
+          sessions.write(msg.sessionId, msg.data, msg.tabId);
           break;
         }
 
         // Resize terminal
         case 'resize': {
-          sessions.resize(msg.sessionId, msg.cols, msg.rows);
+          sessions.resize(msg.sessionId, msg.cols, msg.rows, msg.tabId);
+          break;
+        }
+
+        // Create a new tab in a session
+        case 'createTab': {
+          const result = sessions.createTab(msg.sessionId, { name: msg.name });
+          ws.send(JSON.stringify({ type: 'tab:created', ...result }));
+          break;
+        }
+
+        // Kill a tab
+        case 'killTab': {
+          sessions.killTab(msg.sessionId, msg.tabId);
+          break;
+        }
+
+        // Toggle server-side auto-accept for a session
+        case 'autoAccept': {
+          sessions.setAutoAccept(msg.sessionId, msg.enabled);
+          ws.send(JSON.stringify({ type: 'autoAccept', sessionId: msg.sessionId, enabled: sessions.getAutoAccept(msg.sessionId) }));
           break;
         }
 
@@ -409,6 +755,22 @@ sessions.on('session:attention', (sessionId, reason, preview) => {
   }
 });
 
+// Broadcast voice speak requests to all connected clients; client filters by active session
+sessions.on('session:speak', (sessionId, text) => {
+  const msg = JSON.stringify({ type: 'speak', sessionId, text });
+  for (const client of wss.clients) {
+    if (client.readyState === 1) client.send(msg);
+  }
+});
+
+// Server-synthesized Kokoro audio; client plays the WAV blob directly.
+sessions.on('session:speakAudio', (sessionId, audio_b64, format) => {
+  const msg = JSON.stringify({ type: 'speak-audio', sessionId, audio_b64, format });
+  for (const client of wss.clients) {
+    if (client.readyState === 1) client.send(msg);
+  }
+});
+
 // Periodic status broadcast (so dashboard stays fresh)
 setInterval(() => {
   if (wss.clients.size > 0) broadcastSessionList();
@@ -442,7 +804,7 @@ function detectIPs() {
 
 // ── Tray icon (desktop only) ────────────────────────────────────────
 
-import { spawn as cpSpawn } from 'child_process';
+import { spawn as cpSpawn, execSync } from 'child_process';
 
 let trayProcess = null;
 
@@ -544,4 +906,20 @@ server.listen(PORT, '0.0.0.0', () => {
 
   // Launch tray icon if on a desktop (has DISPLAY/WAYLAND) and Electron is installed
   launchTray();
+
+  // Start the Whisper helper if configured (best-effort; fall back to Android STT on failure)
+  if (settings.whisper?.enabled && settings.whisper?.model) {
+    whisperMgr.whisper
+      .start({ model: settings.whisper.model, device: settings.whisper.device || 'auto' })
+      .then(() => console.log(`[whisper] ready model=${settings.whisper.model} device=${settings.whisper.device}`))
+      .catch((e) => console.error('[whisper] failed to start:', e.message));
+  }
+
+  // Start the Kokoro TTS helper if configured (best-effort; fall back to Android TTS on failure)
+  if (settings.tts?.enabled && settings.tts?.voice) {
+    ttsMgr.tts
+      .start({ voice: settings.tts.voice, device: settings.tts.device || 'auto', speed: settings.tts.speed || 1.0 })
+      .then(() => console.log(`[tts] ready voice=${settings.tts.voice} device=${settings.tts.device}`))
+      .catch((e) => console.error('[tts] failed to start:', e.message));
+  }
 });

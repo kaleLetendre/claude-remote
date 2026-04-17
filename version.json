@@ -1,8 +1,46 @@
 {
-  "version": "0.2.1",
-  "settingsVersion": 2,
-  "minClientVersion": "0.1.0",
+  "version": "0.4.0",
+  "settingsVersion": 4,
+  "minClientVersion": "0.3.4",
   "changelog": [
+    {
+      "version": "0.4.0",
+      "date": "2026-04-13",
+      "changes": [
+        "Server-side Kokoro TTS — optional natural neural voice, replaces robotic Android TTS",
+        "Admin panel: install kokoro-onnx + model/voices in one click, pick voice and speed",
+        "Falls back to Android system TTS when disabled or synth fails"
+      ]
+    },
+    {
+      "version": "0.3.3",
+      "date": "2026-04-12",
+      "changes": [
+        "Voice TTS: route through media audio stream (follows headphone output)",
+        "Voice: don't re-speak buffered output when re-subscribing to a session"
+      ]
+    },
+    {
+      "version": "0.3.1",
+      "date": "2026-04-06",
+      "changes": [
+        "Dev app icon: dark background to distinguish from prod",
+        "Prod server protected by systemd (requires sudo to stop)",
+        "Reliable dev restart script (scripts/restart-dev.sh)"
+      ]
+    },
+    {
+      "version": "0.3.0",
+      "date": "2026-04-03",
+      "changes": [
+        "Voice mode — speak to Claude, hands-free input via talk button",
+        "Native Android TTS for voice output (no HTTPS required)",
+        "Auto-accept toggle for tool approval prompts",
+        "Claude Code hooks replace regex-based status detection",
+        "Session tree view groups sessions by directory",
+        "Terminal refit when keyboard opens"
+      ]
+    },
     {
       "version": "0.2.0",
       "date": "2026-04-01",

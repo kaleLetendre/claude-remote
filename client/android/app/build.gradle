@@ -1,14 +1,46 @@
 apply plugin: 'com.android.application'
 
+// ── Sync app version from project-root version.json ──────────────────────
+// This ensures the bootstrap meta tag that goes into the APK always matches
+// the version.json the server reports. Without this, a direct gradle build
+// (bypassing cli.js build-apk) can produce an APK whose version disagrees
+// with the server, causing the update prompt to fire forever.
+def projectRoot = file("$rootDir/../..")
+def versionJsonFile = file("$projectRoot/version.json")
+def appVersionFromJson = "0.0.0"
+if (versionJsonFile.exists()) {
+    def parsed = new groovy.json.JsonSlurper().parse(versionJsonFile)
+    appVersionFromJson = parsed.version ?: "0.0.0"
+}
+
+tasks.register('syncAppVersion') {
+    doLast {
+        def pattern = ~/(<meta name="app-version" content=")[^"]*(")/
+        def replacement = "\$1${appVersionFromJson}\$2"
+        // Source bootstrap (checked into git) — keeps working tree honest
+        def bootstrapHtml = file("$projectRoot/client/bootstrap/index.html")
+        if (bootstrapHtml.exists()) {
+            bootstrapHtml.text = bootstrapHtml.text.replaceAll(pattern, replacement)
+        }
+        // Assets copied by capacitor sync — this is what actually gets packaged
+        def assetHtml = file("$projectDir/src/main/assets/public/index.html")
+        if (assetHtml.exists()) {
+            assetHtml.text = assetHtml.text.replaceAll(pattern, replacement)
+        }
+        logger.lifecycle("[syncAppVersion] synced to ${appVersionFromJson}")
+    }
+}
+preBuild.dependsOn 'syncAppVersion'
+
 android {
-    namespace "com.clauderemote.app"
+    namespace "com.clauderemote.dev"
     compileSdk rootProject.ext.compileSdkVersion
     defaultConfig {
-        applicationId "com.clauderemote.app"
+        applicationId "com.clauderemote.dev"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
-        versionName "1.0"
+        versionName appVersionFromJson
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
