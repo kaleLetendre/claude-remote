@@ -1,0 +1,59 @@
+#!/bin/bash
+# post-merge — preserve per-branch Android app identity after any merge.
+#
+# .gitattributes handles capacitor.config.ts and strings.xml via merge=identityours.
+# This hook handles the two things gitattributes can't:
+#   1. build.gradle — must stay mergeable (contains shared syncAppVersion task),
+#      so we patch the identity fields in place based on the current branch.
+#   2. Java package dir — merge brings in the other branch's java/.../{app,dev}/
+#      as new files; we delete the orphan dir here.
+#
+# If either fixup produces changes, we create a follow-up commit so the working
+# tree ends in a clean, pushable state. Never amends the merge commit.
+
+set -e
+
+BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+JAVA_ROOT="client/android/app/src/main/java/com/clauderemote"
+GRADLE="client/android/app/build.gradle"
+
+case "$BRANCH" in
+  main)
+    WANT_ID="com.clauderemote.app"
+    ORPHAN_ID="com.clauderemote.dev"
+    ORPHAN_DIR="$JAVA_ROOT/dev"
+    ;;
+  dev)
+    WANT_ID="com.clauderemote.dev"
+    ORPHAN_ID="com.clauderemote.app"
+    ORPHAN_DIR="$JAVA_ROOT/app"
+    ;;
+  *)
+    # Non-identity branch (feature branch etc.) — do nothing.
+    exit 0
+    ;;
+esac
+
+CHANGED=0
+
+# 1. Patch build.gradle identity fields if the merge pulled in the wrong ID.
+if [ -f "$GRADLE" ] && grep -q "\"$ORPHAN_ID\"" "$GRADLE"; then
+  sed -i "s/\"$ORPHAN_ID\"/\"$WANT_ID\"/g" "$GRADLE"
+  echo "[identity] restored $WANT_ID in $GRADLE"
+  CHANGED=1
+fi
+
+# 2. Delete the orphan Java package dir the merge brought over.
+if [ -d "$ORPHAN_DIR" ]; then
+  find "$ORPHAN_DIR" -type f -delete
+  find "$ORPHAN_DIR" -type d -empty -delete
+  echo "[identity] removed orphan $ORPHAN_DIR"
+  CHANGED=1
+fi
+
+if [ "$CHANGED" = "1" ]; then
+  git add -A
+  if ! git diff --cached --quiet; then
+    git commit -m "[auto] restore $BRANCH branch app identity after merge"
+  fi
+fi

@@ -290,14 +290,22 @@ The dev and prod APKs **MUST** have different Android application IDs so both ca
 | **Icon BG** | Dark (`#1A1A2E`) | White (`#FFFFFF`) |
 | **Port** | 3034 | 3033 |
 
-These values are set in three places that **must stay in sync**:
+These values live in four places per branch:
 1. `client/capacitor.config.ts` — `appId` and `appName`
 2. `client/android/app/build.gradle` — `namespace` and `applicationId`
 3. `client/android/app/src/main/res/values/strings.xml` — `app_name`, `title_activity_main`, `package_name`, `custom_url_scheme`
+4. `client/android/app/src/main/java/com/clauderemote/{dev,app}/*.java` — the Java package dir + `package` declaration
 
-The Java source lives in `client/android/app/src/main/java/com/clauderemote/dev/` (dev) or `.../app/` (prod). The `package` declaration in each `.java` file must match the namespace.
+### Automation (don't work around it manually)
 
-**NEVER change these values on the dev branch to match prod, or vice versa.** When merging dev→main, the app identity files must be reverted to prod values. When merging main→dev, they must be kept at dev values.
+Per-branch identity is preserved across merges automatically:
+- **`.gitattributes`** marks `capacitor.config.ts` and `strings.xml` with `merge=identityours`. During any merge, those files silently keep the current branch's version.
+- **`.githooks/post-merge`** handles what gitattributes can't: it patches `build.gradle`'s `namespace`/`applicationId` back to the current branch's values, deletes the orphan Java package dir the merge brought over, and creates a follow-up `[auto] restore <branch> branch app identity` commit if anything changed.
+- **`scripts/postinstall.js`** registers the `identityours` driver and points `core.hooksPath` at `.githooks/` on every `npm install`. First-time setup: run `npm install` or the two `git config` commands manually.
+
+A normal `git merge dev` on main (or `git merge main` on dev) now "just works" — the merged tree has the other branch's code changes but this branch's identity.
+
+**When adding a new identity-sensitive file**, update `.gitattributes` (for pure-identity files) or `.githooks/post-merge` (for files that must stay mergeable). Never manually "revert identity" during a merge — if the automation isn't doing the right thing, fix the automation.
 
 ---
 
