@@ -1,10 +1,11 @@
 import express from 'express';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
-import { join } from 'path';
+import { join, resolve as resolvePath, basename } from 'path';
 import { readFileSync, writeFileSync, existsSync, statSync } from 'fs';
 import crypto from 'crypto';
 import os from 'os';
+import archiver from 'archiver';
 import { SessionManager } from './sessions.js';
 import { Updater } from './updater.js';
 import * as whisperMgr from './whisper-manager.js';
@@ -260,6 +261,55 @@ app.get('/api/files', authCheck, (req, res) => {
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
+});
+
+// Download a single file
+app.get('/api/files/download', authCheck, (req, res) => {
+  const raw = req.query.path;
+  if (!raw) return res.status(400).json({ error: 'path required' });
+  const resolved = resolvePath(raw);
+  let st;
+  try {
+    st = statSync(resolved);
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'not found' });
+    if (err.code === 'EACCES') return res.status(403).json({ error: 'permission denied' });
+    return res.status(400).json({ error: err.message });
+  }
+  if (!st.isFile()) return res.status(400).json({ error: 'not a file' });
+  res.download(resolved, basename(resolved));
+});
+
+// Download a folder as a zip stream
+app.get('/api/files/download-zip', authCheck, (req, res) => {
+  const raw = req.query.path;
+  if (!raw) return res.status(400).json({ error: 'path required' });
+  const resolved = resolvePath(raw);
+  let st;
+  try {
+    st = statSync(resolved);
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'not found' });
+    if (err.code === 'EACCES') return res.status(403).json({ error: 'permission denied' });
+    return res.status(400).json({ error: err.message });
+  }
+  if (!st.isDirectory()) return res.status(400).json({ error: 'not a directory' });
+
+  const name = basename(resolved) || 'root';
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', `attachment; filename="${name}.zip"`);
+
+  const archive = archiver('zip', { zlib: { level: 6 } });
+  archive.on('warning', (err) => {
+    if (err.code !== 'ENOENT') console.warn('[zip] warning:', err.message);
+  });
+  archive.on('error', (err) => {
+    console.error('[zip] error:', err.message);
+    try { res.status(500).end(); } catch {}
+  });
+  archive.pipe(res);
+  archive.directory(resolved, name);
+  archive.finalize();
 });
 
 // Server info

@@ -420,6 +420,14 @@
           window.open(e.data.url, '_blank');
         }
       }
+      if (e.data?.type === 'download-file' && e.data.url) {
+        // Same handling as APK download: hand off to system browser/download manager.
+        if (window.NativeBridge) {
+          try { window.NativeBridge.openInBrowser(e.data.url); } catch {}
+        } else {
+          window.open(e.data.url, '_blank');
+        }
+      }
     });
   </script>
 </body>

@@ -636,6 +636,15 @@ function navigate(view, params = {}) {
       initAdminFrame();
       break;
 
+    case 'files':
+      backBtn.classList.remove('hidden');
+      $('#btn-voice-mode')?.classList.add('hidden');
+      $('#btn-auto-accept')?.classList.add('hidden');
+      label.textContent = 'Files';
+      main.appendChild(cloneTemplate('tpl-file-browser'));
+      initFileBrowser(params.path);
+      break;
+
     case 'connect':
       backBtn.classList.add('hidden');
       label.textContent = 'Connect';
@@ -733,6 +742,7 @@ function initDashboard() {
 
   $('#btn-new-session').onclick = showNewSessionDialog;
   $('#btn-quick-chat').onclick = showQuickChatPrompt;
+  $('#btn-files').onclick = () => navigate('files');
 
   // Request fresh list
   wsSend({ type: 'list' });
@@ -1003,6 +1013,161 @@ function formatSize(bytes) {
   if (bytes < 1024) return bytes + 'B';
   if (bytes < 1048576) return (bytes / 1024).toFixed(1) + 'K';
   return (bytes / 1048576).toFixed(1) + 'M';
+}
+
+// ── File Browser View ───────────────────────────────────────
+
+async function initFileBrowser(startPath) {
+  let currentPath = startPath || '';
+
+  async function load(path) {
+    const listEl = $('#file-list');
+    if (!listEl) return;
+    listEl.innerHTML = '<div class="dir-item dim" style="cursor:default;">Loading…</div>';
+    try {
+      const { entries, path: resolved } = await api.get(`/api/files?path=${encodeURIComponent(path)}`);
+      currentPath = resolved;
+      $('#current-path').textContent = resolved;
+      listEl.innerHTML = '';
+
+      const parent = resolved.split('/').slice(0, -1).join('/') || '/';
+      if (resolved !== '/' && resolved !== '') {
+        const parentRow = createBrowserItem({ name: '..', type: 'dir', path: parent }, { isParent: true });
+        parentRow.onclick = () => load(parent);
+        listEl.appendChild(parentRow);
+      }
+
+      if (!entries.length) {
+        const empty = document.createElement('div');
+        empty.className = 'dir-item';
+        empty.style.cursor = 'default';
+        empty.style.color = 'var(--text-3)';
+        empty.textContent = 'Empty folder';
+        listEl.appendChild(empty);
+        return;
+      }
+
+      for (const entry of entries) {
+        const item = createBrowserItem(entry);
+        if (entry.type === 'dir') {
+          item.onclick = (e) => {
+            if (e.target.closest('.file-zip-btn')) return;
+            load(entry.path);
+          };
+        } else {
+          item.onclick = (e) => {
+            if (e.target.closest('.file-zip-btn')) return;
+            downloadFile(entry.path);
+          };
+        }
+        listEl.appendChild(item);
+      }
+    } catch (err) {
+      listEl.innerHTML = `<div class="dir-item" style="color:var(--red)">${err.message}</div>`;
+    }
+  }
+
+  const zipBtn = $('#btn-zip-current');
+  if (zipBtn) {
+    zipBtn.onclick = () => {
+      if (currentPath) armOrZip(zipBtn, currentPath);
+    };
+  }
+
+  load(currentPath);
+}
+
+function createBrowserItem(entry, opts = {}) {
+  const div = document.createElement('div');
+  div.className = 'dir-item';
+
+  const icon = document.createElement('span');
+  icon.className = 'dir-item-icon';
+  icon.textContent = opts.isParent ? '↩' : (entry.type === 'dir' ? '📁' : '📄');
+
+  const nameEl = document.createElement('span');
+  nameEl.className = 'dir-item-name';
+  nameEl.textContent = entry.name;
+
+  div.appendChild(icon);
+  div.appendChild(nameEl);
+
+  if (entry.size !== null && entry.size !== undefined) {
+    const sizeEl = document.createElement('span');
+    sizeEl.className = 'dir-item-size';
+    sizeEl.textContent = formatSize(entry.size);
+    div.appendChild(sizeEl);
+  }
+
+  if (!opts.isParent && entry.type === 'dir') {
+    const zipBtn = document.createElement('button');
+    zipBtn.className = 'file-zip-btn';
+    zipBtn.title = 'Download as zip';
+    zipBtn.textContent = '⬇ zip';
+    zipBtn.onclick = (e) => {
+      e.stopPropagation();
+      armOrZip(zipBtn, entry.path);
+    };
+    div.appendChild(zipBtn);
+  } else if (!opts.isParent && entry.type !== 'dir') {
+    const dlBtn = document.createElement('button');
+    dlBtn.className = 'file-zip-btn';
+    dlBtn.title = 'Download';
+    dlBtn.textContent = '⬇';
+    dlBtn.onclick = (e) => {
+      e.stopPropagation();
+      downloadFile(entry.path);
+    };
+    div.appendChild(dlBtn);
+  }
+
+  return div;
+}
+
+function buildDownloadUrl(routePath, filePath) {
+  const base = state.serverUrl || '';
+  return `${base}${routePath}?path=${encodeURIComponent(filePath)}&token=${state.token}`;
+}
+
+function triggerDownload(url) {
+  if (window.parent !== window) {
+    window.parent.postMessage({ type: 'download-file', url }, '*');
+  } else {
+    window.open(url, '_blank');
+  }
+}
+
+function downloadFile(path) {
+  triggerDownload(buildDownloadUrl('/api/files/download', path));
+}
+
+function downloadZip(path) {
+  triggerDownload(buildDownloadUrl('/api/files/download-zip', path));
+}
+
+function armOrZip(btn, path) {
+  if (btn.dataset.armed === '1') {
+    clearTimeout(Number(btn.dataset.timeoutId));
+    btn.textContent = btn.dataset.originalText || '⬇ zip';
+    btn.classList.remove('armed');
+    delete btn.dataset.armed;
+    delete btn.dataset.timeoutId;
+    delete btn.dataset.originalText;
+    downloadZip(path);
+    return;
+  }
+  btn.dataset.originalText = btn.textContent;
+  btn.textContent = 'tap again';
+  btn.classList.add('armed');
+  btn.dataset.armed = '1';
+  const timeoutId = setTimeout(() => {
+    btn.textContent = btn.dataset.originalText || '⬇ zip';
+    btn.classList.remove('armed');
+    delete btn.dataset.armed;
+    delete btn.dataset.timeoutId;
+    delete btn.dataset.originalText;
+  }, 2500);
+  btn.dataset.timeoutId = String(timeoutId);
 }
 
 // ── Session / Terminal View ─────────────────────────────────

@@ -38,9 +38,21 @@ pkill -f "run\.sh.*start.*claude-remote[^-]" 2>/dev/null || true
 pkill -f "run\.sh.*start$" --cwd "$SCRIPT_DIR" 2>/dev/null || true
 
 # ── Step 2: Start fresh ─────────────────────────────────
+# Sanitize env so dev never inherits prod's CLAUDE_REMOTE_DATA / PORT
+# (happens when this script is invoked from a pty spawned by the prod server).
 info "Starting dev server..."
 cd "$SCRIPT_DIR"
-nohup ./run.sh start > /tmp/claude-remote-dev.log 2>&1 &
+# Use `setsid` (not just nohup) so the wrapper becomes its own session
+# leader, fully detached from the launching pty's session. Otherwise the
+# dev tree stays a member of that pty's session, and when the app session
+# that started it is closed or reaped, node-pty's group kill takes the
+# wrapper down with it — killing the restart loop, so dev never comes back.
+# Log is appended (not truncated) with a launch marker so a death that
+# happens later is still diagnosable instead of being overwritten.
+LOG=/tmp/claude-remote-dev.log
+echo "===== dev launch $(date '+%Y-%m-%d %H:%M:%S') =====" >> "$LOG"
+setsid env -u CLAUDE_REMOTE_DATA -u CLAUDE_REMOTE_PORT -u PORT \
+  ./run.sh start >> "$LOG" 2>&1 < /dev/null &
 disown
 
 # ── Step 3: Wait for it to come up ──────────────────────

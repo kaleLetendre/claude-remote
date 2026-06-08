@@ -887,14 +887,41 @@ main#main {
   border-bottom: 1px solid var(--border-0);
   background: var(--bg-1);
   position: sticky; top: 0;
+  display: flex; align-items: center; gap: 8px;
 }
 .file-path {
   font-family: var(--font-mono);
   font-size: 12px;
   color: var(--text-2);
+  flex: 1;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  direction: rtl; text-align: left;
 }
 
 .file-list { padding: 4px 0; }
+
+.file-zip-btn {
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid var(--border-1);
+  color: var(--text-2);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  cursor: pointer;
+}
+.file-zip-btn:active { background: var(--bg-2); }
+.file-zip-btn.armed {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.dash-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
 
 /* ── Scrollbars ──────────────────────────────────── */
 ::-webkit-scrollbar { width: 3px; height: 3px; }

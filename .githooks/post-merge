@@ -1,35 +1,40 @@
 #!/bin/bash
 # post-merge — preserve per-branch Android app identity after any merge.
 #
-# .gitattributes handles capacitor.config.ts and strings.xml via merge=identityours.
-# This hook handles the two things gitattributes can't:
-#   1. build.gradle — must stay mergeable (contains shared syncAppVersion task),
-#      so we patch the identity fields in place based on the current branch.
-#   2. Java package dir — each branch stores MainActivity/AttentionPollerService
-#      under java/com/clauderemote/{app|dev}/. A merge brings in the OTHER
-#      branch's dir (with content changes we want to keep) and may delete the
-#      current branch's dir. We relocate the content into this branch's dir
-#      and rewrite the `package` declaration.
+# The merge=identityours driver in .gitattributes only fires on real conflicts.
+# When only ONE branch touched a file (common case: main never touches identity,
+# dev rarely does), git auto-applies that side — bypassing the driver. So this
+# hook handles the full set:
+#   - capacitor.config.ts  → sed appId / appName
+#   - strings.xml          → sed the four identity strings
+#   - build.gradle         → sed namespace / applicationId
+#   - java/.../{app,dev}/  → relocate files to current branch's package dir,
+#                            rewrite the `package` declaration
 #
-# If either fixup produces changes, we create a follow-up commit so the working
-# tree ends in a clean, pushable state. Never amends the merge commit.
+# If any fixup produces changes we create a follow-up commit. Never amends.
 
 set -e
 
 BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 JAVA_ROOT="client/android/app/src/main/java/com/clauderemote"
 GRADLE="client/android/app/build.gradle"
+CAPACITOR="client/capacitor.config.ts"
+STRINGS="client/android/app/src/main/res/values/strings.xml"
 
 case "$BRANCH" in
   main)
     WANT_ID="com.clauderemote.app"
     ORPHAN_ID="com.clauderemote.dev"
+    WANT_NAME="Claude Remote"
+    ORPHAN_NAME="CR Dev"
     WANT_DIR="$JAVA_ROOT/app"
     ORPHAN_DIR="$JAVA_ROOT/dev"
     ;;
   dev)
     WANT_ID="com.clauderemote.dev"
     ORPHAN_ID="com.clauderemote.app"
+    WANT_NAME="CR Dev"
+    ORPHAN_NAME="Claude Remote"
     WANT_DIR="$JAVA_ROOT/dev"
     ORPHAN_DIR="$JAVA_ROOT/app"
     ;;
@@ -41,16 +46,32 @@ esac
 
 CHANGED=0
 
-# 1. Patch build.gradle identity fields if the merge pulled in the wrong ID.
+# 1. capacitor.config.ts — appId / appName
+if [ -f "$CAPACITOR" ] && grep -q "'$ORPHAN_ID'" "$CAPACITOR"; then
+  sed -i "s/'$ORPHAN_ID'/'$WANT_ID'/g" "$CAPACITOR"
+  sed -i "s/appName: '$ORPHAN_NAME'/appName: '$WANT_NAME'/g" "$CAPACITOR"
+  echo "[identity] restored $WANT_ID / '$WANT_NAME' in $CAPACITOR"
+  CHANGED=1
+fi
+
+# 2. strings.xml — app_name, title_activity_main, package_name, custom_url_scheme
+if [ -f "$STRINGS" ] && grep -q ">$ORPHAN_NAME<\|>$ORPHAN_ID<" "$STRINGS"; then
+  sed -i "s/>$ORPHAN_NAME</>$WANT_NAME</g" "$STRINGS"
+  sed -i "s/>$ORPHAN_ID</>$WANT_ID</g" "$STRINGS"
+  echo "[identity] restored '$WANT_NAME' / $WANT_ID in $STRINGS"
+  CHANGED=1
+fi
+
+# 3. build.gradle — namespace / applicationId
 if [ -f "$GRADLE" ] && grep -q "\"$ORPHAN_ID\"" "$GRADLE"; then
   sed -i "s/\"$ORPHAN_ID\"/\"$WANT_ID\"/g" "$GRADLE"
   echo "[identity] restored $WANT_ID in $GRADLE"
   CHANGED=1
 fi
 
-# 2. Relocate Java files from the orphan package dir into this branch's dir.
-#    This preserves content changes (e.g., MainActivity edits) while keeping
-#    the correct on-disk path for the current branch's package namespace.
+# 4. Relocate Java files from the orphan package dir into this branch's dir.
+#    Preserves content changes (e.g., MainActivity edits) while keeping the
+#    correct on-disk path for the current branch's package namespace.
 if [ -d "$ORPHAN_DIR" ]; then
   mkdir -p "$WANT_DIR"
   for src in "$ORPHAN_DIR"/*; do
@@ -59,7 +80,6 @@ if [ -d "$ORPHAN_DIR" ]; then
     mv "$src" "$dest"
   done
   find "$ORPHAN_DIR" -type d -empty -delete
-  # Rewrite `package com.clauderemote.<other>;` → current branch's package
   find "$WANT_DIR" -name "*.java" -exec sed -i "s/package $ORPHAN_ID;/package $WANT_ID;/g" {} \;
   echo "[identity] relocated java from $ORPHAN_DIR → $WANT_DIR"
   CHANGED=1

@@ -58,7 +58,10 @@
         <h2 class="dash-title">Mission Control</h2>
         <p class="dash-subtitle" id="server-info">Connecting…</p>
       </div>
-      <button class="btn-primary" id="btn-new-session">+ New Session</button>
+      <div class="dash-actions">
+        <button class="btn-secondary btn-sm" id="btn-files">Files</button>
+        <button class="btn-primary" id="btn-new-session">+ New Session</button>
+      </div>
     </div>
     <button class="fab" id="btn-quick-chat">⚡</button>
     <div class="session-grid" id="session-grid">
@@ -182,6 +185,7 @@
   <div class="file-browser">
     <div class="file-path-bar">
       <span class="file-path" id="current-path"></span>
+      <button class="file-zip-btn" id="btn-zip-current" title="Download this folder as zip">⬇ zip</button>
     </div>
     <div class="file-list" id="file-list"></div>
   </div>
